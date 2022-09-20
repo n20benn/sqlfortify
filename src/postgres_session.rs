@@ -1,23 +1,32 @@
-use std::io;
-use std::collections::HashMap;
+use std::{cmp, io};
+use std::collections::{HashMap, VecDeque};
 
-use crate::wire::Buffer;
 use super::wire_reader::WireReader;
+use super::sql_session::*;
 
-use super::ring_buffer::RingBuffer;
-use super::session::{ClientSession, Request, RequestType, Response, ResponseType, ServerSession};
+// Minimum number of bytes needed to extract 'length' field from packet
+const STARTUP_PKT_HDRLEN: usize = 4;
+const STANDARD_PKT_HDRLEN: usize = 5;
 
+const DEFAULT_REQ_RESP_BUFLEN: usize = 1*1024*1024; // 1MB
 
-const MAX_PACKET_SIZE: u32 = u32::MAX / 2; // Packets don't get this big in postgres
+const MAX_PACKET_SIZE: u32 = u32::MAX / 2; // Packets very rarely get this big in Postgres
 
+enum SessionState {
+    Startup,
+    SSLRequestSent,
+    StartupSent,
+    Authentication,
+    AuthenticationSent,
+    ReadyForData,
+    SimpleQuerySent,
 
-struct RequestPacket<'a> {
-    length: usize,
-    content: ReqPacketType<'a>,
+    PermError,
 }
 
-enum ReqPacketType<'a> {
-    /// Encapsulates SASLResponse, 
+
+enum RequestPacket<'a> {
+    /// Encapsulates SASLResponse,
     AuthDataResponse(&'a [u8]),
     /// Indicates a Bind command
     /// (destination portal, source prepared statement, parameter format codes, parameters, result-column format codes)
@@ -73,19 +82,15 @@ enum ReqPacketType<'a> {
     /// Requests the connection be encrypted with SSL
     SSLRequest,
     /// Requests a particular user be connected to the database
-    StartupMessage(PostgresWireProtocol, &'a str, HashMap<&'a str, &'a str>),
+    StartupMessage(PostgresWireVersion, &'a str, HashMap<&'a str, &'a str>),
     /// Requests a Sync command be performed
     Sync,
     /// Identifies the message as a termination
     Terminate,
 }
 
-struct ResponsePacket<'a> {
-    length: usize,
-    content: RespPacketType<'a>,
-}
 
-enum RespPacketType<'a> {
+enum ResponsePacket<'a> {
     /// Indicates successful authentication
     AuthenticationOk,
     /// Indicates that Kerberos V5 authentication is required
@@ -161,7 +166,7 @@ enum RespPacketType<'a> {
     ReadyForQuery(TransactionStatus),
     /// Returns data for a single row
     /// (field name, table ID, column ID, data type object ID, data type size, type modifier, is_binary)
-    RowDescription(Vec<(&'a str, i32, i16, i32, i16, i32, bool)>)
+    RowDescription(Vec<(&'a str, i32, i16, i32, i16, i32, bool)>),
 }
 
 enum TransactionStatus {
@@ -170,79 +175,171 @@ enum TransactionStatus {
     /// Currently in a transaction block
     Transaction,
     /// In a failed transaction block (queries will be rejected until block is ended)
-    FailedTransaction
+    FailedTransaction,
+}
+
+enum PostgresWireVersion {
+    V3_0,
 }
 
 
-
-enum PostgresWireProtocol {
-    V3_0
+pub struct PostgresRequest {
+    basic_type: RequestBasicType,
+    is_valid: bool,
+    packet_start: usize,
+    raw_data: Vec<u8>,
+    raw_len: usize,
 }
 
-
-
-pub struct PostgresRequest<'a> {
-
-}
-
-impl<'a> PostgresRequest<'a> {
-    pub fn get_content(&self) -> PostgresRequestContent<'a> {
-
+impl PostgresRequest {
+    fn new() -> Self {
+        PostgresRequest {
+            basic_type: RequestBasicType::AdditionalInformation,
+            is_valid: false,
+            packet_start: 0,
+            raw_data: Vec::from_iter(std::iter::repeat(0).take(DEFAULT_REQ_RESP_BUFLEN)), // TODO: is this inefficient? is there a better way?
+            raw_len: 0,
+        }
     }
 }
 
-impl Request for PostgresRequest<'a> {
-    fn get_type<'a>(&'a self) -> RequestType<'a> {
-        RequestType::<'a>::Authentication
+impl SqlRequest for PostgresRequest {
+    fn get_basic_type<'a>(&'a self) -> &'a RequestBasicType {
+        &self.basic_type // TODO: stub
+    }
+
+    fn as_slice<'a>(&'a self) -> &'a[u8] {
+        &self.raw_data.as_slice()
     }
 }
 
-pub struct PostgresResponse<'a> {
-
+pub struct PostgresResponse {
+    basic_type: ResponseBasicType,
+    is_valid: bool,
+    packet_start: usize,
+    raw_data: Vec<u8>,
+    raw_len: usize,
 }
 
-impl Response for PostgresResponse {
-    fn get_type<'a>(&'a self) -> ResponseType<'a> {
-        ResponseType::<'a>::UnrecoverableError("")
+impl PostgresResponse {
+    fn new() -> Self {
+        PostgresResponse {
+            basic_type: ResponseBasicType::AdditionalInformation,
+            is_valid: false,
+            packet_start: 0,
+            raw_data: Vec::from_iter(std::iter::repeat(0).take(DEFAULT_REQ_RESP_BUFLEN)), // TODO: is this inefficient? is there a better way?
+            raw_len: 0,
+        }
+    }
+}
+
+impl SqlResponse for PostgresResponse {
+    fn basic_type<'a>(&'a self) -> &'a ResponseBasicType {
+        &self.basic_type // TODO: stub
+    }
+
+    fn as_slice<'a>(&'a self) -> &'a[u8] {
+        &self.raw_data.as_slice()
     }
 }
 
 
-
-pub struct PostgresServer<T: io::Read + io::Write> {
-    io_device: T,
+pub struct PostgresClientSession<T: io::Read + io::Write> {
+    client_state: SessionState,
+    io: T,
+    recycled_responses: VecDeque<PostgresResponse>,
+    request_part_idx: Option<usize>,
 }
 
-impl<T: io::Read + io::Write> ServerSession<T> for PostgresServer<T> {
-    type BufferType = RingBuffer;
+impl<T: io::Read + io::Write> SqlClientSession<T> for PostgresClientSession<T> {
     type RequestType = PostgresRequest;
     type ResponseType = PostgresResponse;
 
     fn new(io: T) -> Self {
-        PostgresServer {
-            io_device: io,
+        PostgresClientSession {
+            client_state: SessionState::Startup,
+            io: io,
+            recycled_responses: VecDeque::new(),
+            request_part_idx: None,
         }
     }
 
-    // fn receive_request(&mut self) -> io::Result<Self::RequestType>;
-
-    fn receive_request_raw(&mut self, buffer: &mut Self::BufferType) -> io::Result<Self::RequestType> {
-        Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+    fn send_request(&mut self, request: &Self::RequestType) -> io::Result<()> {
+        send_request(&mut self.io, request, &mut self.client_state, &mut self.request_part_idx)
     }
 
-    fn receive_raw(&mut self, buffer: &mut Self::BufferType) -> io::Result<Vec<Self::RequestType>> {
-        Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+    fn receive_response(&mut self) -> io::Result<Self::ResponseType> {
+        let mut response = match self.recycled_responses.pop_front() {
+            Some(req) => req,
+            None => PostgresResponse::new()
+        };
+
+        match receive_response(&mut self.io, &mut response, &mut self.client_state) {
+            Ok(()) => Ok(response),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.recycled_responses.push_front(response);
+                Err(e)
+            },
+            Err(e) => Err(e)
+        }
     }
 
-    // fn send_response(&mut self, response: &Self::ResponseType) -> io::Result<()>;
-
-    fn send_response_raw(&mut self, buffer: &mut Self::BufferType, response: &Self::ResponseType) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+    /// Safely reuses the allocated structures and buffers of the given response, thereby resulting in fewer repeated allocations of large buffers
+    fn recycle_response(&mut self, response: Self::ResponseType) {
+        self.recycled_responses.push_back(response);
     }
 
-    fn send_raw(&mut self, buffer: &mut Self::BufferType) -> io::Result<()> {
-        write_underlying_io(&mut self.io_device, buffer.get_readable_vectored())?;
-        Ok(())
+    fn get_io_ref(&self) -> &T {
+        &self.io
+    }
+}
+
+
+pub struct PostgresServerSession<T: io::Read + io::Write> {
+    io_device: T,
+    recycled_requests: VecDeque<PostgresRequest>,
+    response_part_idx: Option<usize>,
+    server_state: SessionState,
+}
+
+impl<T: io::Read + io::Write> SqlServerSession<T> for PostgresServerSession<T> {
+
+    type RequestType = PostgresRequest;
+    type ResponseType = PostgresResponse;
+
+    fn new(io: T) -> Self {
+        PostgresServerSession {
+            io_device: io,
+            recycled_requests: VecDeque::new(),
+            response_part_idx: None,
+            server_state: SessionState::Startup,
+        }
+    }
+
+    fn receive_request(&mut self) -> io::Result<Self::RequestType> {
+        let mut request = match self.recycled_requests.pop_front() {
+            Some(req) => req,
+            None => PostgresRequest::new()
+        };
+
+
+        match receive_request(&mut self.io_device, &mut request, &mut self.server_state) {
+            Ok(()) => Ok(request),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.recycled_requests.push_front(request);
+                Err(e)
+            },
+            Err(e) => Err(e)
+        }
+    }
+
+    fn send_response(&mut self, response: &Self::ResponseType) -> io::Result<()> {
+        send_response(&mut self.io_device, response, &mut self.server_state, &mut self.response_part_idx)
+    }
+
+    /// Safely reuses the allocated structures and buffers of the given request, thereby resulting in fewer repeated allocations of large buffers
+    fn recycle_request(&mut self, request: Self::RequestType) {
+        self.recycled_requests.push_back(request);
     }
 
     fn get_io_ref(&self) -> &T {
@@ -250,74 +347,210 @@ impl<T: io::Read + io::Write> ServerSession<T> for PostgresServer<T> {
     }
 }
 
-
-pub struct PostgresClient<T: io::Read + io::Write> {
-    io_device: T,
+pub struct PostgresProxySession<C: io::Read + io::Write, S: io::Read + io::Write> {
+    client_io: C,
+    client_state: SessionState,
+    recycled_requests: VecDeque<PostgresRequest>,
+    recycled_responses: VecDeque<PostgresResponse>,
+    request_part_idx: Option<usize>,
+    response_part_idx: Option<usize>,
+    server_io: S,
+    server_state: SessionState,
 }
 
-impl<T: io::Read + io::Write> ClientSession<T> for PostgresClient<T> {
-    type BufferType = RingBuffer;
+impl<C: io::Read + io::Write, S: io::Read + io::Write> SqlProxySession<C, S> for PostgresProxySession<C, S> {
     type RequestType = PostgresRequest;
     type ResponseType = PostgresResponse;
 
-    fn new(io: T) -> Self {
-        PostgresClient { 
-            io_device: io,
+    fn new(client_io: C, server_io: S) -> Self {
+        PostgresProxySession {
+            client_io: client_io,
+            client_state: SessionState::Startup,
+            server_io: server_io,
+            request_part_idx: None,
+            response_part_idx: None,
+            recycled_requests: VecDeque::new(),
+            recycled_responses: VecDeque::new(),
+            server_state: SessionState::Startup,
         }
     }
 
-    // fn send_request(&mut self, request: &Self::RequestType) -> io::Result<()>;
+    fn server_receive_request(&mut self) -> io::Result<Self::RequestType> {
+        let mut request = match self.recycled_requests.pop_front() {
+            Some(req) => req,
+            None => PostgresRequest::new()
+        };
 
-    fn send_request_raw(&mut self, buffer: &mut Self::BufferType, request: &Self::RequestType) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+
+        match receive_request(&mut self.server_io, &mut request, &mut self.server_state) {
+            Ok(()) => Ok(request),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.recycled_requests.push_front(request);
+                Err(e)
+            },
+            Err(e) => Err(e)
+        }
     }
 
-    fn send_raw(&mut self, buffer: &mut Self::BufferType) -> io::Result<()> {
-        // TODO: we still need to parse packet types/lengths and keep track of our current state
-        write_underlying_io(&mut self.io_device, buffer.get_readable_vectored())?;
-        Ok(())
+    fn server_send_response(&mut self, response: &Self::ResponseType) -> io::Result<()> {
+        send_response(&mut self.server_io, response, &mut self.server_state, &mut self.response_part_idx)
     }
 
-    // fn receive_response(&mut self) -> io::Result<Self::ResponseType>;
+    fn client_receive_response(&mut self) -> io::Result<Self::ResponseType> {
+        let mut response = match self.recycled_responses.pop_front() {
+            Some(req) => req,
+            None => PostgresResponse::new()
+        };
 
-    fn receive_response_raw(&mut self, buffer: &mut Self::BufferType) -> io::Result<Self::ResponseType> {
-        Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+        match receive_response(&mut self.client_io, &mut response, &mut self.client_state) {
+            Ok(()) => Ok(response),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.recycled_responses.push_front(response);
+                Err(e)
+            },
+            Err(e) => Err(e)
+        }
     }
 
-    fn receive_raw(&mut self, buffer: &mut Self::BufferType) -> io::Result<Vec<Self::ResponseType>> {
-        //read_underlying_io(&mut self.io_device, buffer.get_writable_vectored())?;
-        Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+    fn client_send_request(&mut self, request: &Self::RequestType) -> io::Result<()> {
+        send_request(&mut self.client_io, request, &mut self.client_state, &mut self.request_part_idx)
     }
 
-    fn get_io_ref(&self) -> &T {
-        &self.io_device
+    /// Safely reuses the allocated structures and buffers of the given request, thereby resulting in fewer repeated allocations of large buffers
+    fn recycle_request(&mut self, request: Self::RequestType) {
+        self.recycled_requests.push_back(request);
+    }
+
+    /// Safely reuses the allocated structures and buffers of the given response, thereby resulting in fewer repeated allocations of large buffers
+    fn recycle_response(&mut self, response: Self::ResponseType) {
+        self.recycled_responses.push_back(response);
+    }
+
+    fn get_client_io_ref(&self) -> &C {
+        &self.client_io
+    }
+
+    fn get_server_io_ref(&self) -> &S {
+        &self.server_io
     }
 }
 
-fn read_underlying_io<'a, T: io::Read + io::Write>(io: &mut T, buffer: &mut [io::IoSliceMut<'a>]) -> io::Result<usize> {
-    match io.read_vectored(buffer) {
-        Ok(0) => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "I/O device had no more bytes to read (read connection closed)")),
-        Ok(w) => Ok(w),
-        Err(e) => match e.kind() {
-            io::ErrorKind::ConnectionAborted => return Err(io::Error::new(io::ErrorKind::Other, e.to_string())), // Unlikely (and not specified by POSIX), but this will prevent error confusion
-            _ => return Err(e)
+fn move_up_to<'a>(buf: &'a mut [u8] , amount: usize) -> &'a mut [u8] {
+    match buf.get_mut(amount..) {
+        Some(b) => b,
+        None => &mut []
+    }
+}
+
+fn read_packet<'a, T: io::Read>(io: &mut T, buf: &'a mut Vec<u8>, raw_len: usize, pkt_start_idx: usize, pkt_len: usize) -> io::Result<&'a mut [u8]> {
+    // avoid usize overflow here
+    if usize::MAX - pkt_len > pkt_start_idx {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "packet received exceeded max packet processing size"))
+    }
+
+    if pkt_start_idx + pkt_len > buf.len() {
+        let extension_len = cmp::max(buf.len(), pkt_start_idx + pkt_len); // We need more buffer--at least double the current one
+        buf.extend(std::iter::repeat(0).take(extension_len));
+    }
+
+    let packet_buffer = &mut buf[pkt_start_idx..pkt_start_idx + pkt_len];
+
+    let initially_read = cmp::max(raw_len - pkt_start_idx, 0);
+    let mut remaining_buffer = move_up_to(packet_buffer, initially_read);
+
+    loop {
+        if remaining_buffer.len() == 0 {
+            return Ok(packet_buffer)
+        }
+
+        match io.read(remaining_buffer) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "I/O device unexpectedly had no more data")),
+            Ok(len) => remaining_buffer = move_up_to(remaining_buffer, len),
+            Err(e) => return Err(e)
         }
     }
 }
 
-fn write_underlying_io<'a, T: io::Read + io::Write>(io: &mut T, buffer: &[io::IoSlice<'a>]) -> io::Result<usize> {
-    match io.write_vectored(buffer) {
-        Ok(0) => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "I/O device refused to write any bytes (write connection closed)")),
-        Ok(w) => Ok(w),
-        Err(e) => match e.kind() {
-            io::ErrorKind::ConnectionAborted => return Err(io::Error::new(io::ErrorKind::Other, e.to_string())), // Unlikely (and not specified by POSIX), but this will prevent error confusion
-            _ => return Err(e)
+fn receive_request<T: io::Read>(io: &mut T, request: &mut PostgresRequest, state: &mut SessionState) -> io::Result<()> {
+    // TODO: make sure that input reading comes from buffered I/O
+
+    match state {
+        SessionState::Startup => {
+            // Read first header bytes of the packet
+            let header_bytes = read_packet(io, &mut request.raw_data, request.raw_len, request.packet_start, STARTUP_PKT_HDRLEN)?;
+            let packet_len = match read_startup_packet_len(header_bytes) {
+                Ok(l) => l,
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            };
+
+            let packet_bytes = read_packet(io, &mut request.raw_data, request.raw_len, request.packet_start, packet_len)?;
+            request.packet_start += packet_len;
+            match parse_startup_req_packet(packet_bytes) {
+                Ok(RequestPacket::SSLRequest) => (),
+                Ok(RequestPacket::GSSENCRequest) => ()
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            }
+        },
+        _ => {
+
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+}
+
+fn receive_response<T: io::Read>(io: &mut T, response: &mut PostgresResponse, state: &mut SessionState) -> io::Result<()> {
+
+
+
+    Err(io::Error::new(io::ErrorKind::Other, "unimplemented"))
+}
+
+fn send_request<T: io::Write>(io: &mut T, request: &PostgresRequest, state: &mut SessionState, start: &mut Option<usize>) -> io::Result<()> {
+    let mut total_written = start.unwrap_or(0);
+
+    let buf = match request.as_slice().get(total_written..) {
+        Some(b) => b,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected request packet sent out of order (invalid length)"))
+    };
+
+    loop {
+        *start = Some(total_written);
+        match io.write(buf) {
+            Ok(num_written) => total_written += num_written,
+            Err(e) => return Err(e)
+        }
+
+        if total_written == request.as_slice().len() {
+            *start = None;
+            return Ok(())
         }
     }
 }
 
-fn read_startup_header(buffer: &[u8]) -> Result<usize, &'static str> {
-    let reader = WireReader::new(buffer);
+fn send_response<T: io::Write>(io: &mut T, response: &PostgresResponse, state: &mut SessionState, start: &mut Option<usize>) -> io::Result<()> {
+    let mut total_written = start.unwrap_or(0);
+
+    if start.is_some() && response.as_slice().len() <= total_written {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response packet sent out of order (invalid length)"))
+    }
+
+    loop {
+        *start = Some(total_written);
+        match io.write(&response.as_slice()[total_written..]) {
+            Ok(num_written) => total_written += num_written,
+            Err(e) => return Err(e)
+        }
+
+        if total_written == response.as_slice().len() {
+            *start = None;
+            return Ok(())
+        }
+    }
+}
+
+
+fn read_startup_packet_len(buffer: &[u8]) -> Result<usize, &'static str> {
+    let mut reader = WireReader::new(buffer);
     let packet_length = reader.read_int32()?;
     if packet_length < 0 {
         Err("packet length field was a negative value")
@@ -326,8 +559,8 @@ fn read_startup_header(buffer: &[u8]) -> Result<usize, &'static str> {
     }
 }
 
-fn read_standard_header(buffer: &[u8]) -> Result<(u8, usize), &'static str> {
-    let reader = WireReader::new(buffer);
+fn read_standard_packet_len(buffer: &[u8]) -> Result<(u8, usize), &'static str> {
+    let mut reader = WireReader::new(buffer);
     let identifier = reader.read_byte()?;
     let packet_length = match reader.read_int32()? {
         len if len < 0 => return Err("packet length field was a negative value"),
@@ -338,8 +571,8 @@ fn read_standard_header(buffer: &[u8]) -> Result<(u8, usize), &'static str> {
 }
 
 fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'static str> {
-    let packet_length = read_startup_header(buffer)?;
-    let reader = WireReader::new(buffer);
+    let packet_length = read_startup_packet_len(buffer)?;
+    let mut reader = WireReader::new(buffer);
     reader.advance_up_to(4);
 
     let protocol_field = reader.read_int32()?;
@@ -349,28 +582,25 @@ fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'sta
     }
 
     let protocol_version = match protocol_field {
-        196608 => PostgresWireProtocol::V3_0, // TODO: allow all minor versions to use this major version as well...?
-        80877102 => return Ok(RequestPacket { length: packet_length as usize, content: ReqPacketType::CancelRequest(reader.read_int32()?, reader.finalize_after(reader.read_int32())?) }),
-        80877103 => return Ok(RequestPacket { length: packet_length as usize, content: ReqPacketType::SSLRequest }),
-        80877104 => return Ok(RequestPacket { length: packet_length as usize, content: ReqPacketType::GSSENCRequest }),
+        196608 => PostgresWireVersion::V3_0, // TODO: allow all minor versions to use this major version as well...?
+        80877102 => return Ok(RequestPacket::CancelRequest(reader.read_int32()?, reader.read_int32_and_finalize()?)),
+        80877103 => return Ok(RequestPacket::SSLRequest),
+        80877104 => return Ok(RequestPacket::GSSENCRequest),
         _ => return Err("startup packet contained unrecognized protocol version")
     };
 
-    let params = reader.read_utf8_string_string_map_term()?;
+    let params = reader.read_utf8_string_string_map()?;
 
     if let Some(user) = params.get("user") {
-        Ok(RequestPacket { 
-            length: packet_length as usize, 
-            content: ReqPacketType::StartupMessage(protocol_version, user, params)
-        })
+        Ok(RequestPacket::StartupMessage(protocol_version, user, params))
     } else {
         Err("startup packet missing required 'user' parameter")
     }
 }
 
 fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'static str> {
-    let (packet_identifier, packet_length) = read_standard_header(buffer)?;
-    let reader = WireReader::new(buffer);
+    let (packet_identifier, packet_length) = read_standard_packet_len(buffer)?;
+    let mut reader = WireReader::new(buffer);
     reader.advance_up_to(5);
 
     match packet_identifier {
@@ -380,34 +610,39 @@ fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'st
 
     match packet_identifier {
         b'B' => parse_bind_packet(packet_length, reader),
-        b'C' => Ok(RequestPacket { length: packet_length, content: match reader.read_byte()? {
-            b'S' => ReqPacketType::ClosePrepared(reader.finalize_after(reader.read_utf8_c_str())?),
-            b'P' => ReqPacketType::ClosePortal(reader.finalize_after(reader.read_utf8_c_str())?),
-            _ => return Err("packet contained invalid Close type parameter"),
-        }}),
-        b'd' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::CopyData(reader.read_remaining_bytes()) }),
-        b'c' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::CopyDone }),
-        b'f' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::CopyFail(reader.finalize_after(reader.read_utf8_c_str())?) }),
-        b'D' => Ok(RequestPacket { length: packet_length, content: match reader.read_byte()? {
-            b'S' => ReqPacketType::DescribePrepared(reader.finalize_after(reader.read_utf8_c_str())?),
-            b'P' =>ReqPacketType::DescribePortal(reader.finalize_after(reader.read_utf8_c_str())?),
-            _ => return Err("packet contained invalid Describe type parameter"),
-        }}),
-        b'E' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::Execute(reader.read_utf8_c_str()?, reader.finalize_after(reader.read_int32())?) }),
-        b'H' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::Flush }),
+        b'C' => match reader.read_byte()? {
+            b'S' => Ok(RequestPacket::ClosePrepared(reader.read_utf8_c_str_and_finalize()?)),
+            b'P' => Ok(RequestPacket::ClosePortal(reader.read_utf8_c_str_and_finalize()?)),
+            _ => Err("packet contained invalid Close type parameter"),
+        },
+        b'd' => Ok(RequestPacket::CopyData(reader.read_remaining_bytes())),
+        b'c' => Ok(RequestPacket::CopyDone),
+        b'f' => Ok(RequestPacket::CopyFail(reader.read_utf8_c_str_and_finalize()?)),
+        b'D' => match reader.read_byte()? {
+            b'S' => Ok(RequestPacket::DescribePrepared(reader.read_utf8_c_str_and_finalize()?)),
+            b'P' => Ok(RequestPacket::DescribePortal(reader.read_utf8_c_str_and_finalize()?)),
+            _ => Err("packet contained invalid Describe type parameter"),
+        },
+        b'E' => Ok(RequestPacket::Execute(reader.read_utf8_c_str()?, reader.read_int32_and_finalize()?)),
+        b'H' => Ok(RequestPacket::Flush),
         b'F' => parse_function_req_packet(packet_length, reader),
-        b'p' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::AuthDataResponse(reader.read_remaining_bytes()) }),
-        b'P' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::Parse(reader.read_utf8_c_str()?, reader.read_utf8_c_str()?, reader.finalize_after(reader.read_int32_list(reader.read_int16_length()?))?) }),
-        b'Q' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::Query(reader.finalize_after(reader.read_utf8_c_str())?) }),
-        b'S' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::Sync }),
-        b'X' => Ok(RequestPacket { length: packet_length, content: ReqPacketType::Terminate }),
+        b'p' => Ok(RequestPacket::AuthDataResponse(reader.read_remaining_bytes())),
+        b'P' => {
+            let prepared_stmt_name = reader.read_utf8_c_str()?;
+            let query_name = reader.read_utf8_c_str()?;
+            let parameters_cnt = reader.read_int16_length()?;
+            Ok(RequestPacket::Parse(prepared_stmt_name, query_name, reader.read_int32_list_and_finalize(parameters_cnt)?))
+        },
+        b'Q' => Ok(RequestPacket::Query(reader.read_utf8_c_str_and_finalize()?)),
+        b'S' => Ok(RequestPacket::Sync),
+        b'X' => Ok(RequestPacket::Terminate),
         _ => Err("packet contained unrecognized packet identifier")
     }
 }
 
 fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket, &'static str> {
-    let (packet_identifier, packet_length) = read_standard_header(buffer)?;
-    let reader = WireReader::new(buffer);
+    let (packet_identifier, packet_length) = read_standard_packet_len(buffer)?;
+    let mut reader = WireReader::new(buffer);
     reader.advance_up_to(5);
 
     match packet_identifier {
@@ -416,46 +651,53 @@ fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket, &'
     }
 
     match packet_identifier {
-        b'K' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::BackendKeyData(reader.read_int32()?, reader.finalize_after(reader.read_int32())?) }),
+        b'K' => Ok(ResponsePacket::BackendKeyData(reader.read_int32()?, reader.read_int32_and_finalize()?)),
         b'R' => parse_auth_resp_packet(packet_length, reader),
-        b'2' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::BindComplete }),
-        b'3' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::CloseComplete }),
-        b'C' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::CommandComplete(reader.finalize_after(reader.read_utf8_c_str())?) }),
-        b'd' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::CopyData(reader.read_remaining_bytes()) }),
-        b'c' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::CopyDone }),
+        b'2' => Ok(ResponsePacket::BindComplete),
+        b'3' => Ok(ResponsePacket::CloseComplete),
+        b'C' => Ok(ResponsePacket::CommandComplete(reader.read_utf8_c_str_and_finalize()?)),
+        b'd' => Ok(ResponsePacket::CopyData(reader.read_remaining_bytes())),
+        b'c' => Ok(ResponsePacket::CopyDone),
         b'G' => parse_copyin_response_packet(packet_length, reader),
         b'H' => parse_copyout_response_packet(packet_length, reader),
         b'W' => parse_copyboth_response_packet(packet_length, reader),
         b'D' => parse_datarow_response_packet(packet_length, reader),
-        b'I' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::EmptyQueryResponse }),
-        b'E' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::ErrorResponse(reader.finalize_after(reader.read_utf8_byte_string_map_term())?) }),
-        b'V' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::FunctionCallResponse(match reader.read_nullable_int32_length()? {
-            Some(length) => Some(reader.finalize_after(reader.read_bytes(length))?),
+        b'I' => Ok(ResponsePacket::EmptyQueryResponse),
+        b'E' => Ok(ResponsePacket::ErrorResponse(reader.read_term_utf8_byte_string_map_and_finalize()?)),
+        b'V' => Ok(ResponsePacket::FunctionCallResponse(match reader.read_nullable_int32_length()? {
+            Some(length) => Some(reader.read_bytes_and_finalize(length)?),
             None => None
-        }) }),
-        b'v' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::NegotiateProtocolVersion(reader.read_int32()?, reader.finalize_after(reader.read_utf8_c_strs(reader.read_int32_length()?))?) }),
-        b'n' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::NoData }),
-        b'N' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::NoticeResponse(reader.finalize_after(reader.read_utf8_byte_string_map_term())?) }),
-        b'A' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::NotificationResponse(reader.read_int32()?, reader.read_utf8_c_str()?, reader.finalize_after(reader.read_utf8_c_str())?) }),
-        b't' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::ParameterDescription(reader.finalize_after(reader.read_int32_list(reader.read_int16_length()?))?) }),
-        b'S' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::ParameterStatus(reader.read_utf8_c_str()?, reader.finalize_after(reader.read_utf8_c_str())?) }),
-        b'1' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::ParseComplete }),
-        b's' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::PortalSuspended }),
-        b's' => Ok(ResponsePacket { length: packet_length, content: RespPacketType::ReadyForQuery(match reader.read_byte()? {
+        })),
+        b'v' => {
+            let newest_minor_proto = reader.read_int32()?;
+            let options_cnt = reader.read_int32_length()?;
+            Ok(ResponsePacket::NegotiateProtocolVersion(newest_minor_proto, reader.read_utf8_c_strs_and_finalize(options_cnt)?))
+        },
+        b'n' => Ok(ResponsePacket::NoData),
+        b'N' => Ok(ResponsePacket::NoticeResponse(reader.read_term_utf8_byte_string_map_and_finalize()?)),
+        b'A' => Ok(ResponsePacket::NotificationResponse(reader.read_int32()?, reader.read_utf8_c_str()?, reader.read_utf8_c_str_and_finalize()?)),
+        b't' => {
+            let parameters_cnt = reader.read_int16_length()?;
+            Ok(ResponsePacket::ParameterDescription(reader.read_int32_list_and_finalize(parameters_cnt)?))
+        },
+        b'S' => Ok(ResponsePacket::ParameterStatus(reader.read_utf8_c_str()?, reader.read_utf8_c_str_and_finalize()?)),
+        b'1' => Ok(ResponsePacket::ParseComplete),
+        b's' => Ok(ResponsePacket::PortalSuspended),
+        b'Z' => Ok(ResponsePacket::ReadyForQuery(match reader.read_byte()? {
             b'I' => TransactionStatus::Idle,
             b'T' => TransactionStatus::Transaction,
             b'E' => TransactionStatus::FailedTransaction,
             _ => return Err("packet contained unrecognized transaction status indicator")
-        }) }),
+        })),
         b'T' => parse_rowdescription_resp_packet(packet_length, reader),
         _ => Err("packet contained unrecognized packet identifier")
     }
 }
 
 
-fn parse_rowdescription_resp_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
+fn parse_rowdescription_resp_packet<'a>(packet_length: usize, mut reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
     let field_cnt = reader.read_int16_length()?;
-    let fields = Vec::new();
+    let mut fields = Vec::new();
     for _ in 0..field_cnt {
         let field_name = reader.read_utf8_c_str()?;
         let table_object_id = reader.read_int32()?;
@@ -471,13 +713,13 @@ fn parse_rowdescription_resp_packet<'a>(packet_length: usize, reader: WireReader
         fields.push((field_name, table_object_id, attribute_number, data_type_id, data_type_size, type_modifier, format_code));
     }
 
-    Ok(ResponsePacket { length: packet_length, content: RespPacketType::RowDescription(fields) })
+    Ok(ResponsePacket::RowDescription(fields))
 }
 
-fn parse_function_req_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<RequestPacket, &'static str> {
+fn parse_function_req_packet<'a>(packet_length: usize, mut reader: WireReader<'a>) -> Result<RequestPacket, &'static str> {
     let object_id = reader.read_int32()?;
     let arg_format_code_cnt = reader.read_int16_length()?;
-    let arg_format_codes = Vec::new();
+    let mut arg_format_codes = Vec::new();
     for _ in 0..arg_format_code_cnt {
         arg_format_codes.push(match reader.read_int16()? {
             1 => true,
@@ -487,7 +729,7 @@ fn parse_function_req_packet<'a>(packet_length: usize, reader: WireReader<'a>) -
     }
 
     let argument_cnt = reader.read_int16_length()?;
-    let arguments = Vec::new();
+    let mut arguments = Vec::new();
     for _ in 0..argument_cnt {
         arguments.push(match reader.read_nullable_int32_length()? {
             Some(param_length) => Some(reader.read_bytes(param_length)?),
@@ -495,21 +737,18 @@ fn parse_function_req_packet<'a>(packet_length: usize, reader: WireReader<'a>) -
         });
     }
 
-    let function_result_format = match reader.finalize_after(reader.read_int16())? {
+    let function_result_format = match reader.read_int16_and_finalize()? {
         1 => true,
         0 => false,
         _ => return Err("packet contains invalid value for boolean format code field")
     };
 
-    Ok(RequestPacket {
-        length: packet_length,
-        content: ReqPacketType::FunctionCall(object_id, arg_format_codes, arguments, function_result_format)
-    })
+    Ok(RequestPacket::FunctionCall(object_id, arg_format_codes, arguments, function_result_format))
 }
 
-fn parse_datarow_response_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
+fn parse_datarow_response_packet<'a>(packet_length: usize, mut reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
     let column_cnt = reader.read_int16_length()?;
-    let column_values = Vec::new();
+    let mut column_values = Vec::new();
     for _ in 0..column_cnt {
         column_values.push(match reader.read_nullable_int32_length()? {
             Some(column_length) => Some(reader.read_bytes(column_length)?),
@@ -518,37 +757,34 @@ fn parse_datarow_response_packet<'a>(packet_length: usize, reader: WireReader<'a
     }
     reader.finalize()?;
 
-    Ok(ResponsePacket {
-        length: packet_length,
-        content: RespPacketType::DataRow(column_values)
-    })
+    Ok(ResponsePacket::DataRow(column_values))
 }
 
 fn parse_copyin_response_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
     let (is_binary, format_codes) = parse_copy_response_fields(packet_length, reader)?;
-    Ok(ResponsePacket { length: packet_length, content: RespPacketType::CopyInResponse(is_binary, format_codes) })
+    Ok(ResponsePacket::CopyInResponse(is_binary, format_codes))
 }
 
 fn parse_copyout_response_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
     let (is_binary, format_codes) = parse_copy_response_fields(packet_length, reader)?;
-    Ok(ResponsePacket { length: packet_length, content: RespPacketType::CopyOutResponse(is_binary, format_codes) })
+    Ok(ResponsePacket::CopyOutResponse(is_binary, format_codes))
 }
 
 fn parse_copyboth_response_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
     let (is_binary, format_codes) = parse_copy_response_fields(packet_length, reader)?;
-    Ok(ResponsePacket { length: packet_length, content: RespPacketType::CopyBothResponse(is_binary, format_codes) })
+    Ok(ResponsePacket::CopyBothResponse(is_binary, format_codes))
 }
 
-fn parse_copy_response_fields<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<(bool, Vec<bool>), &'static str> {
+fn parse_copy_response_fields<'a>(packet_length: usize, mut reader: WireReader<'a>) -> Result<(bool, Vec<bool>), &'static str> {
     let is_binary = match reader.read_byte()? {
         b'1' => true,
         b'0' => false,
         _ => return Err("packet contains invalid value for boolean copy format field")
     };
 
-    let format_codes_cnt = reader.read_int16_length();
-    let format_codes = Vec::new();
-    for _ in format_codes_cnt {
+    let format_codes_cnt = reader.read_int16_length()?;
+    let mut format_codes = Vec::new();
+    for _ in 0..format_codes_cnt {
         format_codes.push(match reader.read_int16()? {
             1 => true,
             0 => false,
@@ -559,37 +795,34 @@ fn parse_copy_response_fields<'a>(packet_length: usize, reader: WireReader<'a>) 
     Ok((is_binary, format_codes))
 }
 
-fn parse_auth_resp_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
+fn parse_auth_resp_packet<'a>(packet_length: usize, mut reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
     let auth_mechanism = reader.read_int32()?;
     match auth_mechanism {
         0 | 2 | 6 | 7 | 9  => reader.finalize()?,
         _ => ()
     }
 
-    Ok(ResponsePacket {
-        length: packet_length,
-        content: match auth_mechanism {
-            0 => RespPacketType::AuthenticationOk,
-            2 => RespPacketType::AuthenticationKerberosV5,
-            3 => RespPacketType::AuthenticationCleartextPassword,
-            5 => RespPacketType::AuthenticationMD5Password(reader.finalize_after(reader.read_bytes_exact_4())?),
-            6 => RespPacketType::AuthenticationSCMCredential,
-            7 => RespPacketType::AuthenticationGSS,
-            8 => RespPacketType::AuthenticationGSSContinue(reader.read_remaining_bytes()),
-            9 => RespPacketType::AuthenticationSSPI,
-            10 => RespPacketType::AuthenticationSASL(reader.finalize_after(reader.read_utf8_c_strs_term())?),
-            11 => RespPacketType::AuthenticationSASLContinue(reader.read_remaining_bytes()),
-            12 => RespPacketType::AuthenticationSASLFinal(reader.read_remaining_bytes()),
-            _ => return Err("")
-        }
-    })
+    match auth_mechanism {
+        0 => Ok(ResponsePacket::AuthenticationOk),
+        2 => Ok(ResponsePacket::AuthenticationKerberosV5),
+        3 => Ok(ResponsePacket::AuthenticationCleartextPassword),
+        5 => Ok(ResponsePacket::AuthenticationMD5Password(reader.read_4_bytes_and_finalize()?)),
+        6 => Ok(ResponsePacket::AuthenticationSCMCredential),
+        7 => Ok(ResponsePacket::AuthenticationGSS),
+        8 => Ok(ResponsePacket::AuthenticationGSSContinue(reader.read_remaining_bytes())),
+        9 => Ok(ResponsePacket::AuthenticationSSPI),
+        10 => Ok(ResponsePacket::AuthenticationSASL(reader.read_term_utf8_c_strs_and_finalize()?)),
+        11 => Ok(ResponsePacket::AuthenticationSASLContinue(reader.read_remaining_bytes())),
+        12 => Ok(ResponsePacket::AuthenticationSASLFinal(reader.read_remaining_bytes())),
+        _ => Err("")
+    }
 }
 
-fn parse_bind_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result<RequestPacket, &'static str> {
+fn parse_bind_packet<'a>(packet_length: usize, mut reader: WireReader<'a>) -> Result<RequestPacket, &'static str> {
     let dest_portal = reader.read_utf8_c_str()?;
     let prepared_stmt = reader.read_utf8_c_str()?;
     let format_codes_cnt = reader.read_int16_length()?;
-    let format_codes = Vec::new();
+    let mut format_codes = Vec::new();
     for _ in 0..format_codes_cnt {
         format_codes.push(match reader.read_int16()? {
             0 => false,
@@ -599,7 +832,7 @@ fn parse_bind_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result
     }
 
     let parameters_cnt = reader.read_int16_length()?;
-    let parameters = Vec::new();
+    let mut parameters = Vec::new();
     for _ in 0..parameters_cnt {
         parameters.push(match reader.read_nullable_int32_length()? {
             Some(param_length) => Some(reader.read_bytes(param_length)?),
@@ -608,7 +841,7 @@ fn parse_bind_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result
     }
 
     let result_format_codes_cnt = reader.read_int16_length()?;
-    let result_format_codes = Vec::new();
+    let mut result_format_codes = Vec::new();
     for _ in 0..result_format_codes_cnt {
         result_format_codes.push(match reader.read_int16()? {
             1 => true,
@@ -617,8 +850,5 @@ fn parse_bind_packet<'a>(packet_length: usize, reader: WireReader<'a>) -> Result
         });
     }
 
-    Ok(RequestPacket { 
-        length: packet_length, 
-        content: ReqPacketType::Bind(dest_portal, prepared_stmt, format_codes, parameters, result_format_codes)
-    })
+    Ok(RequestPacket::Bind(dest_portal, prepared_stmt, format_codes, parameters, result_format_codes))
 }

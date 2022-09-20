@@ -9,8 +9,9 @@ use log::info;
 use super::key_pool::KeyPool;
 use super::proxy::{Proxy, IOEvent};
 use super::token::SqlToken;
-use super::wire::Wire;
 use super::validator::SqlValidator;
+
+use super::sql_session::SqlProxySession;
 
 
 // TODO: WARNING: unsafe code. Replace as soon as API replacement arrives
@@ -44,27 +45,27 @@ impl std::convert::From<std::io::Error> for HandlerError {
 
 
 
-pub struct EventHandler<T: SqlToken, S: Wire<Socket>> {
+pub struct EventHandler<T: SqlToken, P: SqlProxySession<Socket, Socket>> {
     db_addr: SockAddr,
     db_key_map: HashMap<usize, usize>,
     key_pool: KeyPool,
     listener: Socket,
     listener_key: usize,
     poller: Poller,
-    proxies: HashMap<usize, Proxy<T, S>>,
+    proxies: HashMap<usize, Proxy<T, P>>,
     validator: SqlValidator<T>,
 }
 
 
 
-impl<T: SqlToken, S: Wire<Socket>> EventHandler<T, S> {
+impl<T: SqlToken, P: SqlProxySession<Socket, Socket>> EventHandler<T, P> {
     pub fn new(listen_address: SockAddr, db_address: SockAddr) -> Result<Self, HandlerError> {
         let listener = create_listener(&listen_address)?;
         let poller = Poller::new()?;
         let mut pool = KeyPool::new();
         let listener_key = pool.take_key();
 
-        Ok(EventHandler::<T, S> {
+        Ok(EventHandler::<T, P> {
             db_addr: db_address,
             key_pool: pool,
             listener: listener,

@@ -42,8 +42,14 @@ impl<'a> WireReader<'a> {
         return std::str::from_utf8(string).or_else(|_| Err(UTF8_ENCODING_ERROR))
     }
 
+    pub fn read_utf8_c_str_and_finalize(&mut self) -> Result<&'a str, &'static str> {
+        let ret = self.read_utf8_c_str();
+        self.finalize()?;
+        return ret;
+    }
+
     pub fn read_utf8_c_strs(&mut self, count: usize) -> Result<Vec<&'a str>, &'static str> {
-        let strings = Vec::new();
+        let mut strings = Vec::new();
         for _ in 0..count {
             strings.push(self.read_utf8_c_str()?);
         }
@@ -51,8 +57,14 @@ impl<'a> WireReader<'a> {
         Ok(strings)
     }
 
+    pub fn read_utf8_c_strs_and_finalize(&mut self, count: usize) -> Result<Vec<&'a str>, &'static str> {
+        let ret = self.read_utf8_c_strs(count);
+        self.finalize()?;
+        return ret;
+    }
+
     pub fn read_utf8_c_strs_term(&mut self) -> Result<Vec<&'a str>, &'static str> {
-        let strings = Vec::new();
+        let mut strings = Vec::new();
         while !self.empty() && self.bytes.get(0) != Some(&0) {
             strings.push(self.read_utf8_c_str()?);
         }
@@ -65,8 +77,14 @@ impl<'a> WireReader<'a> {
         Ok(strings)
     }
 
-    pub fn read_utf8_string_string_map_term(&mut self) -> Result<HashMap<&'a str, &'a str>, &'static str> {
-        let map = HashMap::new();
+    pub fn read_term_utf8_c_strs_and_finalize(&mut self) -> Result<Vec<&'a str>, &'static str> {
+        let ret = self.read_utf8_c_strs_term();
+        self.finalize()?;
+        return ret;
+    }
+
+    pub fn read_utf8_string_string_map(&mut self) -> Result<HashMap<&'a str, &'a str>, &'static str> {
+        let mut map = HashMap::new();
         while !self.empty() && self.bytes.get(0) != Some(&0) {
             let key = self.read_utf8_c_str()?;
             let value = self.read_utf8_c_str()?;
@@ -83,8 +101,8 @@ impl<'a> WireReader<'a> {
         Ok(map)
     }
 
-    pub fn read_utf8_byte_string_map_term(&mut self) -> Result<HashMap<u8, &'a str>, &'static str> {
-        let map = HashMap::new();
+    pub fn read_term_utf8_byte_string_map(&mut self) -> Result<HashMap<u8, &'a str>, &'static str> {
+        let mut map = HashMap::new();
         while !self.empty() && self.bytes.get(0) != Some(&0) {
             let key = self.read_byte()?;
             let value = self.read_utf8_c_str()?;
@@ -101,6 +119,12 @@ impl<'a> WireReader<'a> {
         Ok(map)
     }
 
+    pub fn read_term_utf8_byte_string_map_and_finalize(&mut self) -> Result<HashMap<u8, &'a str>, &'static str> {
+        let ret = self.read_term_utf8_byte_string_map();
+        self.finalize()?;
+        return ret;
+    }
+
     pub fn read_int32(&mut self) -> Result<i32, &'static str> {
         let (int32_bytes, remaining_bytes) = try_split_at(self.bytes, 4);
         let res: Result<&[u8; 4], _> = int32_bytes.try_into();
@@ -113,6 +137,12 @@ impl<'a> WireReader<'a> {
         }
     }
 
+    pub fn read_int32_and_finalize(&mut self) -> Result<i32, &'static str> {
+        let ret = self.read_int32();
+        self.finalize()?;
+        return ret;
+    }
+
     pub fn read_int16(&mut self) -> Result<i16, &'static str> {
         let (int16_bytes, remaining_bytes) = try_split_at(self.bytes, 2);
         let res: Result<&[u8; 2], _> = int16_bytes.try_into();
@@ -123,6 +153,12 @@ impl<'a> WireReader<'a> {
             },
             Err(_) => Err(INSUFFICIENT_DATA_ERROR)
         }
+    }
+
+    pub fn read_int16_and_finalize(&mut self) -> Result<i16, &'static str> {
+        let ret = self.read_int16();
+        self.finalize()?;
+        return ret;
     }
 
     pub fn read_int32_length(&mut self) -> Result<usize, &'static str> {
@@ -143,11 +179,17 @@ impl<'a> WireReader<'a> {
     }
 
     pub fn read_int32_list(&mut self, length: usize) -> Result<Vec<i32>, &'static str> {
-        let list = Vec::new();
+        let mut list = Vec::new();
         for _ in 0..length {
             list.push(self.read_int32()?);
         }
         Ok(list)
+    }
+
+    pub fn read_int32_list_and_finalize(&mut self, length: usize) -> Result<Vec<i32>, &'static str> {
+        let ret = self.read_int32_list(length);
+        self.finalize()?;
+        return ret;
     }
 
     pub fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], &'static str> {
@@ -160,13 +202,19 @@ impl<'a> WireReader<'a> {
         }
     }
 
+    pub fn read_bytes_and_finalize(&mut self, count: usize) -> Result<&'a [u8], &'static str> {
+        let ret = self.read_bytes(count);
+        self.finalize()?;
+        return ret;
+    }
+
     pub fn read_remaining_bytes(&mut self) -> &'a [u8] {
         let remaining = self.bytes;
         self.bytes = &[];
         remaining
     }
 
-    pub fn read_bytes_exact_4(&mut self) -> Result<&'a [u8; 4], &'static str> {
+    pub fn read_4_bytes(&mut self) -> Result<&'a [u8; 4], &'static str> {
         let (needed_bytes, remaining_bytes) = try_split_at(self.bytes, 4);
         match needed_bytes.try_into() {
             Ok(exact) => {
@@ -177,22 +225,16 @@ impl<'a> WireReader<'a> {
         }
     }
 
+    pub fn read_4_bytes_and_finalize(&mut self) -> Result<&'a [u8; 4], &'static str> {
+        let ret = self.read_4_bytes();
+        self.finalize()?;
+        return ret;
+    }
+
     /// Advances the reader's index by up to `num_bytes` forward. If the reader's index
     /// reaches the end in fewer than `num_bytes`, it will stay at the end.
     pub fn advance_up_to(&mut self, num_bytes: usize) {
         self.bytes = self.bytes.get(num_bytes..).unwrap_or(&[])
-    }
-
-    pub fn finalize_after<T>(&mut self, return_value: Result<T, &'static str>) -> Result<T, &'static str> {
-        match return_value {
-            Ok(val) => if self.bytes.len() > 0 {
-                self.bytes = &[];
-                Err("invalid packet length--unrecognized data at end of packet")
-            } else {
-                Ok(val)
-            }
-            Err(e) => Err(e)
-        }
     }
 
     pub fn finalize(&mut self) -> Result<(), &'static str> {

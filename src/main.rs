@@ -7,30 +7,29 @@ mod matcher;
 mod validator;
 mod token;
 mod proxy;
-mod wire;
-mod postgres_wire;
-mod session;
+mod sql_session;
 mod postgres_session;
 mod key_pool;
 //mod iso_token;
 //mod postgres_token;
 mod cockroach_token;
 mod event_handler;
-mod mysql_wire;
+mod mysql_session;
 mod base_session;
-mod ring_buffer;
 mod wire_reader;
 
 use log::{error, info, trace};
 use socket2::{Socket,SockAddr};
 use std::{panic, process, thread};
 use std::net::SocketAddr;
+use std::io;
 
 use event_handler::EventHandler;
 use token::SqlToken;
-use wire::Wire;
 use cockroach_token::CockroachToken;
-use postgres_wire::PostgresWire;
+
+use sql_session::SqlProxySession;
+use postgres_session::PostgresProxySession;
 
 
 fn main() {
@@ -94,17 +93,17 @@ fn main() {
     // #[cfg(target_family="unix")]
     // SockAddr::unix(String::from("Path"));
 
-    create_thread::<CockroachToken, PostgresWire<Socket>>(listen, db);
+    create_thread::<CockroachToken, PostgresProxySession<Socket, Socket>>(listen, db);
     
     loop {
         thread::park(); // Not guaranteed to block forever, so we loop
     }
 }
 
-fn create_thread<T, S>(listen_address: SockAddr, db_address: SockAddr) 
-where T: SqlToken, S: Wire<Socket> {
+fn create_thread<T, P>(listen_address: SockAddr, db_address: SockAddr)  // NOTE: could add C, S generics here that impl io::read and io::write to extend functionality beyond inet sockets
+where T: SqlToken, P: SqlProxySession<Socket, Socket>  {
     let _ = thread::Builder::new().name("CockroachDB".to_string()).spawn(move || {
-        let mut handler: EventHandler<T, S>;
+        let mut handler: EventHandler<T, P>;
 
         match EventHandler::new(listen_address, db_address) {
             Ok(h) => handler = h,
