@@ -2,60 +2,59 @@ use std::io;
 
 // Requests and responses have a 1-to-1 mapping
 
-
-#[derive(PartialEq, Eq)]
-pub enum RequestBasicType {
-    /// The initial packet sequence that connects the client to a particular db. Parameters: (username, database)
-    Startup(String, String),
-    /// Packet sequences pertaining to the client and server authenticating each other
-    Authentication,
-    /// A packet sequence containing a SQL statement that will be executed by the database.
-    Query(String),
-    /// (not seen yet) A packet sequence containing several consecutive SQL statements.
-    /// Queries(Vec<String>),
-    /// A packet sequence indicating a request to change the username currently logged into. Parameters: username
-    ChangeUser(String),
-    /// A packet sequence indicating a request to change the database (and potentially username) currently connected to. Parameters: (database, username)
-    ChangeDatabase(String, Option<String>),
-    /// Packet sequences that do not involve SQL, but nonetheless execute actions on the database. Includes functions (such as \copy for postgres)
-    Command,
-    /// Indicates an attempt to initiate SSL encryption
-    SSLEncryption,
-    /// Information transferred to the server that doesn't constitute a distinct request (requests of this type should not be kept track of in upper layers)
-    AdditionalInformation,
-    /// Catch-all for sequences of packets that don't fit any other RequestType, but are nonetheless still considered direct requests (see `AdditionalInformation` for packet sequences that aren't considered requests)
-    Other
+pub struct MessageInfo {
+    /// If set, indicates that the given username should be used for subsequent SQL queries.
+    pub username: Option<String>,
+    /// If set, indicates that the given database should be used for subsequent SQL queries.
+    pub database: Option<String>,
+    /// If set, indicates that the message contains the given SQL query that will be executed by the SQL server
+    pub query: Option<String>,
+    /// If true, indicates that the message is requesting information from the other side that should be met with a corresponding 'result' message.
+    pub is_request: bool,
+    /// If set, indicates that the message is a definitive result for a corresponding request in the message stream with either a successful (true) or failed (false) outcome.
+    pub result: Option<bool>,
+    /// If true, the given packet is attempting to indicate or request SSL encryption support with the other side.
+    pub ssl_requested: bool,
+    /// If true, the given packet is attempting to indicate or request GSSAPI encryption support with the other side.
+    pub gssenc_requested: bool,
+    /// If true, the protocol requested by the given packet is not supported by the current version of this library.
+    pub unsupported_version: bool,
 }
 
-#[derive(PartialEq, Eq)]
-pub enum ResponseBasicType {
-    /// An error that immediately invalidates the current session (thus requiring the client to reconnect)
-    UnrecoverableError(String),
-    /// A recoverable error reported for a single request.
-    IndividualError(String),
-    /// Indicates success in completing a given request.
-    RequestCompleted,
-    /// Information transferred back to the client that doesn't constitute a distinct response (responses of this type should not be kept track of in upper layers)
-    AdditionalInformation,
+impl MessageInfo {
+    /// Creates a default message that does not convey any significant information to the upper layer.
+    pub fn new() -> Self {
+        MessageInfo {
+            username: None,
+            database: None,
+            query: None,
+            is_request: false,
+            result: None,
+            ssl_requested: false,
+            gssenc_requested: false,
+            unsupported_version: false,
+        }
+    }
 }
 
-
-pub trait SqlRequest {
-    fn get_basic_type<'a>(&'a self) -> &'a RequestBasicType;
+pub trait ClientMessage {
+    fn get_basic_info<'a>(&'a self) -> &'a MessageInfo;
+//    fn get_basic_type<'a>(&'a self) -> &'a ClientMessageType;
 
     fn as_slice<'a>(&'a self) -> &'a[u8];
 }
 
-pub trait SqlResponse {
-    fn basic_type<'a>(&'a self) -> &'a ResponseBasicType;
+pub trait ServerMessage {
+    fn get_basic_info<'a>(&'a self) -> &'a MessageInfo;
+//    fn get_basic_type<'a>(&'a self) -> &'a ServerMessageType;
 
     fn as_slice<'a>(&'a self) -> &'a[u8];
 }
 
 
-pub trait SqlClientSession<T: io::Read + io::Write> {
-    type RequestType: SqlRequest;
-    type ResponseType: SqlResponse;
+pub trait ClientSession<T: io::Read + io::Write> {
+    type RequestType: ClientMessage;
+    type ResponseType: ServerMessage;
 
     fn new(io: T) -> Self;
 
@@ -70,9 +69,9 @@ pub trait SqlClientSession<T: io::Read + io::Write> {
     fn get_io_ref(&self) -> &T;
 }
 
-pub trait SqlServerSession<T: io::Read + io::Write> {
-    type RequestType: SqlRequest;
-    type ResponseType: SqlResponse;
+pub trait ServerSession<T: io::Read + io::Write> {
+    type RequestType: ClientMessage;
+    type ResponseType: ServerMessage;
 
     fn new(io: T) -> Self;
 
@@ -87,9 +86,9 @@ pub trait SqlServerSession<T: io::Read + io::Write> {
 }
 
 
-pub trait SqlProxySession<C: io::Read + io::Write, S: io::Read + io::Write> {
-    type RequestType: SqlRequest;
-    type ResponseType: SqlResponse;
+pub trait ProxySession<C: io::Read + io::Write, S: io::Read + io::Write> {
+    type RequestType: ClientMessage;
+    type ResponseType: ServerMessage;
 
     fn new(client_io: C, server_io: S) -> Self;
 
@@ -111,4 +110,12 @@ pub trait SqlProxySession<C: io::Read + io::Write, S: io::Read + io::Write> {
     fn get_client_io_ref(&self) -> &C;
 
     fn get_server_io_ref(&self) -> &S;
+
+    fn client_downgrade_ssl(ssl_request: &mut Self::RequestType) -> Option<Self::ResponseType>;
+
+    fn server_downgrade_ssl(ssl_response: &mut Self::ResponseType) -> Option<Self::RequestType>;
+
+    fn client_downgrade_gssenc(gssenc_request: &mut Self::RequestType) -> Option<Self::ResponseType>;
+
+    fn client_downgrade_protocol(proto_request: &mut Self::RequestType) -> Option<Self::ResponseType>;
 }

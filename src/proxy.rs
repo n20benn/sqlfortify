@@ -2,7 +2,7 @@ use socket2::{Socket, SockAddr};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::{net, io, ops};
-use super::sql_session::{RequestBasicType, ResponseBasicType, SqlRequest, SqlResponse, SqlProxySession};
+use super::sql_session::{ClientMessage, ServerMessage, ProxySession};
 
 use super::validator::SqlValidator;
 use super::token::SqlToken;
@@ -65,7 +65,7 @@ impl ops::BitOrAssign for IOEvent {
 /// Handles and proxies a single SQL connection between an incoming client connection 
 /// and the backend database.
 /// 
-pub struct Proxy<T: SqlToken, P: SqlProxySession<Socket, Socket>> {
+pub struct Proxy<T: SqlToken, P: ProxySession<Socket, Socket>> {
     client_read_closed: bool,
     client_key: usize,
     db_address: SockAddr,
@@ -90,7 +90,7 @@ pub struct Proxy<T: SqlToken, P: SqlProxySession<Socket, Socket>> {
 // 4. Once the packet to remove is reached, use the `advance_read()` function in the Buffer to completely remove the packet
 // 5. Go back to write_raw() after done for efficiency
 
-impl<T: SqlToken, P: SqlProxySession<Socket, Socket>> Proxy<T, P> {
+impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
     pub fn new(client_socket: Socket, database_socket: Socket, database_address: SockAddr, client_key: usize, db_key: usize) -> Self {
         Proxy {
             client_read_closed: false,
@@ -267,20 +267,23 @@ impl<T: SqlToken, P: SqlProxySession<Socket, Socket>> Proxy<T, P> {
             Err(e) => return Err(e)
         };
 
-        match request.get_basic_type() {
-            RequestBasicType::AdditionalInformation => self.incoming_data.push_back(request), // No corresponding response will be returned by server
-            RequestBasicType::Query(query) => match validator.check_query(query) {
+        let req_info = request.get_basic_info();
+        if let Some(query) = &req_info.query {
+            match validator.check_query(query.as_str()) {
                 Err(_) => self.request_queue.push_back(PacketInfo { query: Some(query.clone()), is_malicious: true }), // Don't forward request data, don't want the db to run a malicious query
                 Ok(()) => {
                     self.request_queue.push_back(PacketInfo { query: Some(query.clone()), is_malicious: false });
                     self.incoming_data.push_back(request);
                 },
-            },
-            _ => { // Any other data type is transparently proxied
-                self.request_queue.push_back(PacketInfo { query: None, is_malicious: false });
-                self.incoming_data.push_back(request);
             }
-        };
+        } else {
+            if req_info.is_request {
+                self.request_queue.push_back(PacketInfo { query: None, is_malicious: false });
+            }
+            self.incoming_data.push_back(request);
+        }
+
+        // TODO: handle SSL and GSSENC requests HERE
 
         Ok(())
     }
@@ -365,26 +368,24 @@ impl<T: SqlToken, P: SqlProxySession<Socket, Socket>> Proxy<T, P> {
                 }
             }
 
-            if *response.basic_type() == ResponseBasicType::AdditionalInformation {
-                self.sql_session.recycle_response(response);
-                return Ok(())
-            }
-
-            if let Some(request_info) = self.request_queue.pop_front() {
-                // We presume that no SQL queries coming from an application will trigger errors by default.
-                // Thus, the presence of an error potentially indicates the introduction of additional command syntax (i.e. SQL Injection)
-                match (request_info.query, response.basic_type()) {
-                    (Some(query), ResponseBasicType::RequestCompleted) => validator.update_good_query(query),
-                    (Some(query), _) => validator.update_bad_query(query),
-                    _ => ()
+            if let Some(was_successful) = response.get_basic_info().result {
+                if let Some(request_info) = self.request_queue.pop_front() {
+                    // We presume that no SQL queries coming from an application will trigger errors by default.
+                    // Thus, the presence of an error potentially indicates the introduction of additional command syntax (i.e. SQL Injection)
+                    match (request_info.query, was_successful) {
+                        (Some(query), true) => validator.update_good_query(query.clone()),
+                        (Some(query), false) => validator.update_bad_query(query.clone()),
+                        _ => () // some other non-query request (e.g. a FunctionCall)
+                    }
+                } else {
+                    // Somehow, we received one more response from the database than what we were expecting. This is BAD (as it could lead to erroneous data and errors being passed to the application, not to mention request smuggling...)
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "proxy request/response flow became desynchronized--aborting connection"))
+                    // TODO: make sure this errorkind (InvalidData) doesn't conflict with others
                 }
-
-                self.sql_session.recycle_response(response);
-            } else {
-                // Somehow, we received one more response from the database than what we were expecting. This is BAD (as it could lead to erroneous data and errors being passed to the application, not to mention request smuggling...)
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "proxy request/response flow became desynchronized--aborting connection"))
-                // TODO: make sure this errorkind (InvalidData) doesn't conflict with others
             }
+
+            self.sql_session.recycle_response(response);
+            return Ok(())
         }
 
         // Successfully wrote all remaining data from buffers, so connection can be closed

@@ -11,7 +11,7 @@ use super::proxy::{Proxy, IOEvent};
 use super::token::SqlToken;
 use super::validator::SqlValidator;
 
-use super::sql_session::SqlProxySession;
+use super::sql_session::ProxySession;
 
 
 // TODO: WARNING: unsafe code. Replace as soon as API replacement arrives
@@ -45,7 +45,7 @@ impl std::convert::From<std::io::Error> for HandlerError {
 
 
 
-pub struct EventHandler<T: SqlToken, P: SqlProxySession<Socket, Socket>> {
+pub struct EventHandler<T: SqlToken, P: ProxySession<Socket, Socket>> {
     db_addr: SockAddr,
     db_key_map: HashMap<usize, usize>,
     key_pool: KeyPool,
@@ -58,7 +58,7 @@ pub struct EventHandler<T: SqlToken, P: SqlProxySession<Socket, Socket>> {
 
 
 
-impl<T: SqlToken, P: SqlProxySession<Socket, Socket>> EventHandler<T, P> {
+impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
     pub fn new(listen_address: SockAddr, db_address: SockAddr) -> Result<Self, HandlerError> {
         let listener = create_listener(&listen_address)?;
         let poller = Poller::new()?;

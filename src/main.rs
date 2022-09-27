@@ -9,6 +9,7 @@ mod token;
 mod proxy;
 mod sql_session;
 mod postgres_session;
+mod postgres_packet;
 mod key_pool;
 //mod iso_token;
 //mod postgres_token;
@@ -28,7 +29,7 @@ use event_handler::EventHandler;
 use token::SqlToken;
 use cockroach_token::CockroachToken;
 
-use sql_session::SqlProxySession;
+use sql_session::ProxySession;
 use postgres_session::PostgresProxySession;
 
 
@@ -101,7 +102,7 @@ fn main() {
 }
 
 fn create_thread<T, P>(listen_address: SockAddr, db_address: SockAddr)  // NOTE: could add C, S generics here that impl io::read and io::write to extend functionality beyond inet sockets
-where T: SqlToken, P: SqlProxySession<Socket, Socket>  {
+where T: SqlToken, P: ProxySession<Socket, Socket>  {
     let _ = thread::Builder::new().name("CockroachDB".to_string()).spawn(move || {
         let mut handler: EventHandler<T, P>;
 
