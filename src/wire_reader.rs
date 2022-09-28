@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 
-const INSUFFICIENT_DATA_ERROR: &'static str = "insufficient data in wire packet to parse a required field";
-const OVERSIZED_PACKET_ERROR: &'static str = "invalid packet length--unrecognized data at end of packet";
-const MISSING_NULL_TERMINATOR_ERROR: &'static str = "null terminator missing for a required field in the wire packet";
+const INSUFFICIENT_DATA_ERROR: &'static str =
+    "insufficient data in wire packet to parse a required field";
+const OVERSIZED_PACKET_ERROR: &'static str =
+    "invalid packet length--unrecognized data at end of packet";
+const MISSING_NULL_TERMINATOR_ERROR: &'static str =
+    "null terminator missing for a required field in the wire packet";
 const UTF8_ENCODING_ERROR: &'static str = "invalid UTF-8 characters detected in field";
 const UNIQUE_KEY_ERROR: &'static str = "duplicate value found in field that requires unique values";
-const NEGATIVE_LENGTH_ERROR: &'static str = "wire packet contained length field with invalid negative value";
+const NEGATIVE_LENGTH_ERROR: &'static str =
+    "wire packet contained length field with invalid negative value";
 
 pub struct WireReader<'a> {
     bytes: &'a [u8],
@@ -13,9 +17,7 @@ pub struct WireReader<'a> {
 
 impl<'a> WireReader<'a> {
     pub fn new(wire: &'a [u8]) -> Self {
-        WireReader {
-            bytes: wire,
-        }
+        WireReader { bytes: wire }
     }
 
     pub fn empty(&self) -> bool {
@@ -28,18 +30,18 @@ impl<'a> WireReader<'a> {
                 self.bytes = remaining_bytes;
                 Ok(*byte)
             }
-            None => Err(INSUFFICIENT_DATA_ERROR)
+            None => Err(INSUFFICIENT_DATA_ERROR),
         }
     }
 
     pub fn read_utf8_c_str(&mut self) -> Result<&'a str, &'static str> {
         let (string, remaining_bytes) = match try_split_once(self.bytes, 0) {
             Some(vals) => vals,
-            None => return Err(MISSING_NULL_TERMINATOR_ERROR)
+            None => return Err(MISSING_NULL_TERMINATOR_ERROR),
         };
 
         self.bytes = remaining_bytes;
-        return std::str::from_utf8(string).or_else(|_| Err(UTF8_ENCODING_ERROR))
+        return std::str::from_utf8(string).or_else(|_| Err(UTF8_ENCODING_ERROR));
     }
 
     pub fn read_utf8_c_str_and_finalize(&mut self) -> Result<&'a str, &'static str> {
@@ -53,11 +55,14 @@ impl<'a> WireReader<'a> {
         for _ in 0..count {
             strings.push(self.read_utf8_c_str()?);
         }
-        
+
         Ok(strings)
     }
 
-    pub fn read_utf8_c_strs_and_finalize(&mut self, count: usize) -> Result<Vec<&'a str>, &'static str> {
+    pub fn read_utf8_c_strs_and_finalize(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<&'a str>, &'static str> {
         let ret = self.read_utf8_c_strs(count);
         self.finalize()?;
         return ret;
@@ -71,7 +76,7 @@ impl<'a> WireReader<'a> {
 
         match self.bytes.split_first() {
             Some((0, remaining_bytes)) => self.bytes = remaining_bytes,
-            _ => return Err(MISSING_NULL_TERMINATOR_ERROR)
+            _ => return Err(MISSING_NULL_TERMINATOR_ERROR),
         }
 
         Ok(strings)
@@ -83,19 +88,21 @@ impl<'a> WireReader<'a> {
         return ret;
     }
 
-    pub fn read_utf8_string_string_map(&mut self) -> Result<HashMap<&'a str, &'a str>, &'static str> {
+    pub fn read_utf8_string_string_map(
+        &mut self,
+    ) -> Result<HashMap<&'a str, &'a str>, &'static str> {
         let mut map = HashMap::new();
         while !self.empty() && self.bytes.get(0) != Some(&0) {
             let key = self.read_utf8_c_str()?;
             let value = self.read_utf8_c_str()?;
             if map.insert(key, value) != None {
-                return Err(UNIQUE_KEY_ERROR)
+                return Err(UNIQUE_KEY_ERROR);
             }
         }
 
         match self.bytes.split_first() {
             Some((0, remaining_bytes)) => self.bytes = remaining_bytes,
-            _ => return Err(MISSING_NULL_TERMINATOR_ERROR)
+            _ => return Err(MISSING_NULL_TERMINATOR_ERROR),
         }
 
         Ok(map)
@@ -107,19 +114,21 @@ impl<'a> WireReader<'a> {
             let key = self.read_byte()?;
             let value = self.read_utf8_c_str()?;
             if map.insert(key, value) != None {
-                return Err(UNIQUE_KEY_ERROR)
+                return Err(UNIQUE_KEY_ERROR);
             }
         }
 
         match self.bytes.split_first() {
             Some((0, remaining_bytes)) => self.bytes = remaining_bytes,
-            _ => return Err(MISSING_NULL_TERMINATOR_ERROR)
+            _ => return Err(MISSING_NULL_TERMINATOR_ERROR),
         }
 
         Ok(map)
     }
 
-    pub fn read_term_utf8_byte_string_map_and_finalize(&mut self) -> Result<HashMap<u8, &'a str>, &'static str> {
+    pub fn read_term_utf8_byte_string_map_and_finalize(
+        &mut self,
+    ) -> Result<HashMap<u8, &'a str>, &'static str> {
         let ret = self.read_term_utf8_byte_string_map();
         self.finalize()?;
         return ret;
@@ -132,8 +141,8 @@ impl<'a> WireReader<'a> {
             Ok(b) => {
                 self.bytes = remaining_bytes;
                 Ok(i32::from_be_bytes(*b)) // Network Byte order is big-endian
-            },
-            Err(_) => Err(INSUFFICIENT_DATA_ERROR)
+            }
+            Err(_) => Err(INSUFFICIENT_DATA_ERROR),
         }
     }
 
@@ -150,8 +159,8 @@ impl<'a> WireReader<'a> {
             Ok(b) => {
                 self.bytes = remaining_bytes;
                 Ok(i16::from_be_bytes(*b)) // Network Byte order is big-endian
-            },
-            Err(_) => Err(INSUFFICIENT_DATA_ERROR)
+            }
+            Err(_) => Err(INSUFFICIENT_DATA_ERROR),
         }
     }
 
@@ -174,7 +183,7 @@ impl<'a> WireReader<'a> {
         match int32.try_into() {
             Ok(val) => Ok(Some(val)),
             Err(_) if int32 == -1 => Ok(None),
-            _ => Err(NEGATIVE_LENGTH_ERROR)
+            _ => Err(NEGATIVE_LENGTH_ERROR),
         }
     }
 
@@ -186,7 +195,10 @@ impl<'a> WireReader<'a> {
         Ok(list)
     }
 
-    pub fn read_int32_list_and_finalize(&mut self, length: usize) -> Result<Vec<i32>, &'static str> {
+    pub fn read_int32_list_and_finalize(
+        &mut self,
+        length: usize,
+    ) -> Result<Vec<i32>, &'static str> {
         let ret = self.read_int32_list(length);
         self.finalize()?;
         return ret;
@@ -220,8 +232,8 @@ impl<'a> WireReader<'a> {
             Ok(exact) => {
                 self.bytes = remaining_bytes;
                 Ok(exact)
-            },
-            Err(_) => Err(INSUFFICIENT_DATA_ERROR)
+            }
+            Err(_) => Err(INSUFFICIENT_DATA_ERROR),
         }
     }
 
@@ -247,18 +259,20 @@ impl<'a> WireReader<'a> {
     }
 }
 
-
-/// Splits the slice into two slices, the second of which beginning at `index`. If `index` is greater 
-/// or equal to the the length of `buffer`, the second slice will be empty and the first slice will be 
+/// Splits the slice into two slices, the second of which beginning at `index`. If `index` is greater
+/// or equal to the the length of `buffer`, the second slice will be empty and the first slice will be
 /// the contents of `buffer`.
 fn try_split_at<T>(buffer: &[T], index: usize) -> (&[T], &[T]) {
-    (buffer.get(..index).unwrap_or(buffer), buffer.get(index..).unwrap_or(&[]))
+    (
+        buffer.get(..index).unwrap_or(buffer),
+        buffer.get(index..).unwrap_or(&[]),
+    )
 }
 
 /// Splits the slice into two slices at the first instance of `value`, or returns `None` if `value` is not in the slice.
 fn try_split_once<T: Eq>(buffer: &[T], value: T) -> Option<(&[T], &[T])> {
     match buffer.split(|t| *t == value).next() {
         Some(split_buf) => Some((split_buf, buffer.get(split_buf.len() + 1..).unwrap_or(&[]))),
-        None => None
+        None => None,
     }
 }

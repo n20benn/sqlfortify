@@ -39,18 +39,21 @@ impl MessageInfo {
 
 pub trait ClientMessage {
     fn get_basic_info<'a>(&'a self) -> &'a MessageInfo;
-//    fn get_basic_type<'a>(&'a self) -> &'a ClientMessageType;
+    //    fn get_basic_type<'a>(&'a self) -> &'a ClientMessageType;
 
-    fn as_slice<'a>(&'a self) -> &'a[u8];
+    fn as_slice<'a>(&'a self) -> &'a [u8];
+
+    fn is_valid(&self) -> bool;
 }
 
 pub trait ServerMessage {
     fn get_basic_info<'a>(&'a self) -> &'a MessageInfo;
-//    fn get_basic_type<'a>(&'a self) -> &'a ServerMessageType;
+    //    fn get_basic_type<'a>(&'a self) -> &'a ServerMessageType;
 
-    fn as_slice<'a>(&'a self) -> &'a[u8];
+    fn as_slice<'a>(&'a self) -> &'a [u8];
+
+    fn is_valid(&self) -> bool;
 }
-
 
 pub trait ClientSession<T: io::Read + io::Write> {
     type RequestType: ClientMessage;
@@ -61,7 +64,6 @@ pub trait ClientSession<T: io::Read + io::Write> {
     fn receive_response(&mut self) -> io::Result<Self::ResponseType>;
 
     fn send_request(&mut self, request: &Self::RequestType) -> io::Result<()>;
-
 
     /// Safely reuses the allocated structures and buffers of the given response, thereby resulting in fewer repeated allocations of large buffers
     fn recycle_response(&mut self, response: Self::ResponseType);
@@ -85,21 +87,19 @@ pub trait ServerSession<T: io::Read + io::Write> {
     fn get_io_ref(&self) -> &T;
 }
 
-
 pub trait ProxySession<C: io::Read + io::Write, S: io::Read + io::Write> {
     type RequestType: ClientMessage;
     type ResponseType: ServerMessage;
 
-    fn new(client_io: C, server_io: S) -> Self;
+    fn new(backend_io: C, frontend_io: S) -> Self;
 
-    fn server_receive_request(&mut self) -> io::Result<Self::RequestType>;
+    fn frontend_receive_request(&mut self) -> io::Result<Self::RequestType>;
 
-    fn server_send_response(&mut self, response: &Self::ResponseType) -> io::Result<()>;
+    fn frontend_send_response(&mut self, response: &Self::ResponseType) -> io::Result<()>;
 
-    fn client_receive_response(&mut self) -> io::Result<Self::ResponseType>;
+    fn backend_receive_response(&mut self) -> io::Result<Self::ResponseType>;
 
-    fn client_send_request(&mut self, request: &Self::RequestType) -> io::Result<()>;
-
+    fn backend_send_request(&mut self, request: &Self::RequestType) -> io::Result<()>;
 
     /// Safely reuses the allocated structures and buffers of the given request, thereby resulting in fewer repeated allocations of large buffers
     fn recycle_request(&mut self, request: Self::RequestType);
@@ -107,15 +107,29 @@ pub trait ProxySession<C: io::Read + io::Write, S: io::Read + io::Write> {
     /// Safely reuses the allocated structures and buffers of the given response, thereby resulting in fewer repeated allocations of large buffers
     fn recycle_response(&mut self, request: Self::ResponseType);
 
-    fn get_client_io_ref(&self) -> &C;
+    fn get_backend_io_ref(&self) -> &C;
 
-    fn get_server_io_ref(&self) -> &S;
+    fn get_frontend_io_ref(&self) -> &S;
 
-    fn client_downgrade_ssl(ssl_request: &mut Self::RequestType) -> Option<Self::ResponseType>;
+    fn frontend_downgrade_ssl(
+        &mut self,
+        ssl_request: &mut Self::RequestType,
+    ) -> Option<Self::ResponseType>;
 
-    fn server_downgrade_ssl(ssl_response: &mut Self::ResponseType) -> Option<Self::RequestType>;
+    fn backend_downgrade_ssl(
+        &mut self,
+        ssl_response: &mut Self::ResponseType,
+    ) -> Option<Self::RequestType>;
 
-    fn client_downgrade_gssenc(gssenc_request: &mut Self::RequestType) -> Option<Self::ResponseType>;
+    fn frontend_downgrade_gssenc(
+        &mut self,
+        gssenc_request: &mut Self::RequestType,
+    ) -> Option<Self::ResponseType>;
 
-    fn client_downgrade_protocol(proto_request: &mut Self::RequestType) -> Option<Self::ResponseType>;
+    fn backend_downgrade_protocol(
+        &mut self,
+        proto_request: &mut Self::ResponseType,
+    ) -> Option<Self::RequestType>;
+
+    fn error_response(&mut self) -> Self::ResponseType;
 }

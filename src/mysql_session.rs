@@ -1,9 +1,3 @@
-
-
-
-
-
-
 // Packet Format:
 // int<3> payload_length (length of payload beyond 4 initial header bytes)
 // int<1> sequence_id
@@ -31,19 +25,14 @@
 // }
 // } else {
 // string<EOF> 	info 	human readable status information
-// } 
+// }
 
 // Packet is OK if header = 0x00 and payload_length > 7
 // Packet is EOF if header = 0xfe and payload_length < 9
 // ^ only applies if CLIENT_DEPRECATE_EOF flag is sent by client
-// 
+//
 
-
-
-
-
-
-/* 
+/*
 
 
 pub struct MysqlWire {
@@ -96,9 +85,9 @@ impl SqlWire for MysqlWire {
         Ok(())
     }
 
-    /* 
+    /*
     fn read_header(&mut self, wire: &[u8]) -> Result<Header, WireError> {
-        
+
     }
 
     fn parse_query(&mut self, wire: &[u8]) -> Result<String, WireError> {
@@ -111,12 +100,10 @@ impl SqlWire for MysqlWire {
 
 */
 
-
 // Simple Query
 // Client -- 'Q' --> Server (Single Query message)
 // Server -- <Response message> --> Client (one or more)
 // Server -- 'E' <ErrorMessage> --> Client (potential)
 // Server -- 'Z' <ReadyForQuery> --> Client (indicates next command)
-
 
 // Exception to return: 22018 | invalid_character_value_for_cast

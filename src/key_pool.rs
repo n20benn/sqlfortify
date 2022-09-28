@@ -1,7 +1,5 @@
 use std::collections::HashSet;
 
-
-
 pub struct KeyPool {
     available_keys: HashSet<usize>,
     next_key: usize,
@@ -11,7 +9,7 @@ impl KeyPool {
     pub fn new() -> Self {
         KeyPool {
             available_keys: HashSet::new(),
-            next_key: 0
+            next_key: 0,
         }
     }
 
@@ -20,7 +18,7 @@ impl KeyPool {
             Some(key) => {
                 self.available_keys.remove(&key);
                 key
-            },
+            }
             None => {
                 self.next_key += 1;
                 self.next_key
@@ -32,4 +30,3 @@ impl KeyPool {
         self.available_keys.insert(key);
     }
 }
-

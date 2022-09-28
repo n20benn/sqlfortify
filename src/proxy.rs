@@ -1,23 +1,21 @@
-use socket2::{Socket, SockAddr};
+use super::sql_session::{ClientMessage, ProxySession, ServerMessage};
+use socket2::{SockAddr, Socket};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-use std::{net, io, ops};
-use super::sql_session::{ClientMessage, ServerMessage, ProxySession};
+use std::{io, net, ops};
 
-use super::validator::SqlValidator;
 use super::token::SqlToken;
+use super::validator::SqlValidator;
 
+const BUFFER_SOFT_LIMIT: usize = 10;
 
-
-struct PacketInfo { // PacketOverview? PacketHeader?
+struct RequestMetadata {
     is_malicious: bool,
     query: Option<String>,
 }
 
-
-
 /// The possible connection states of a `Proxy`.
-#[derive(PartialEq,Eq)]
+#[derive(PartialEq, Eq)]
 enum ConnectionState {
     // ClientTLSHandshake, // unimplemented
     DatabaseTCPHandshake, // called connect() to database, awaiting completed connection
@@ -27,7 +25,7 @@ enum ConnectionState {
 
 /// Enumerates the read/write events that a socket cannot send/receive data for
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum IOEvent { 
+pub enum IOEvent {
     /// Indicates that no read or write events on the socket have failed
     None,
     /// Indicates that data could not be read from the socket without blocking
@@ -35,7 +33,7 @@ pub enum IOEvent {
     /// Indicates that data could not be written to the socket without blocking
     Write,
     /// Indicates that data could be neither read from nor written to the socket without blocking
-    ReadWrite, 
+    ReadWrite,
 }
 
 impl ops::BitOr for IOEvent {
@@ -46,25 +44,23 @@ impl ops::BitOr for IOEvent {
             (IOEvent::ReadWrite, _) | (_, IOEvent::None) => self,
             (_, IOEvent::ReadWrite) | (IOEvent::None, _) => rhs,
             (IOEvent::Read, IOEvent::Write) | (IOEvent::Write, IOEvent::Read) => IOEvent::ReadWrite,
-            _ => self // can only be (Write, Write) or (Read, Read)
+            _ => self, // can only be (Write, Write) or (Read, Read)
         }
     }
 }
 
 impl ops::BitOrAssign for IOEvent {
     fn bitor_assign(&mut self, rhs: Self) {
-        *self = *self | rhs // TODO: does this actually work?
+        *self = *self | rhs // Uses bitor() function to properly assign left-hand side
     }
 }
 
-
-
-// With 'send' and 'recv' buffers (along with 'process' queues of maximum sizes) 
+// With 'send' and 'recv' buffers (along with 'process' queues of maximum sizes)
 // large enough to hold multiple requests but small enough to avoid consuming all memory
 
-/// Handles and proxies a single SQL connection between an incoming client connection 
+/// Handles and proxies a single SQL connection between an incoming client connection
 /// and the backend database.
-/// 
+///
 pub struct Proxy<T: SqlToken, P: ProxySession<Socket, Socket>> {
     client_read_closed: bool,
     client_key: usize,
@@ -72,12 +68,12 @@ pub struct Proxy<T: SqlToken, P: ProxySession<Socket, Socket>> {
     db_read_closed: bool,
     db_write_closed: bool,
     db_key: usize,
-    request_queue: VecDeque<PacketInfo>,
+    request_queue: VecDeque<RequestMetadata>,
     incoming_data: VecDeque<P::RequestType>,
     outgoing_data: VecDeque<P::ResponseType>,
     sql_session: P,
     /// The current connectivity state of the proxy
-    state: ConnectionState, 
+    state: ConnectionState,
     _sqltoken_type: PhantomData<T>,
 }
 
@@ -85,13 +81,19 @@ pub struct Proxy<T: SqlToken, P: ProxySession<Socket, Socket>> {
 // 1. read_packet_raw() -> returns Packet (with length) or nothing. When it returns a packet, it advances the readable index by the length of the packet.
 // 1b. both Proxy and PostgresSession keep track of packet sizes using a Vec<usize>
 // 2. write_raw() -> returns a usize indicating number of bytes written. Proxy and Session decrement/remove packet length from Vec based on usize returned.
-// 3. When read_packet_raw() returns a packet that has a malicious query, mark it as a packet to be discarded in the Vec<usize> and start using write_packet_raw(), 
+// 3. When read_packet_raw() returns a packet that has a malicious query, mark it as a packet to be discarded in the Vec<usize> and start using write_packet_raw(),
 // removing packets from the VecDeque<usize>
 // 4. Once the packet to remove is reached, use the `advance_read()` function in the Buffer to completely remove the packet
 // 5. Go back to write_raw() after done for efficiency
 
 impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
-    pub fn new(client_socket: Socket, database_socket: Socket, database_address: SockAddr, client_key: usize, db_key: usize) -> Self {
+    pub fn new(
+        client_socket: Socket,
+        database_socket: Socket,
+        database_address: SockAddr,
+        client_key: usize,
+        db_key: usize,
+    ) -> Self {
         Proxy {
             client_read_closed: false,
             client_key: client_key,
@@ -115,9 +117,8 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
 
     /// Returns the client socket of the given proxy connection.
     pub fn get_client_socket(&self) -> &Socket {
-        self.sql_session.get_client_io_ref()
+        self.sql_session.get_backend_io_ref()
     }
-
 
     /// Returns the polling key associated with the database socket of the given proxy.
     pub fn get_db_key(&self) -> usize {
@@ -128,22 +129,24 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
         self.client_read_closed && self.db_write_closed
     }
 
-
     /// Returns the database socket of the given proxy.
     pub fn get_db_socket(&self) -> &Socket {
-        self.sql_session.get_server_io_ref()
+        self.sql_session.get_frontend_io_ref()
     }
 
-    /// Progresses the state of the given proxy connection by attempting each of the following operations once, 
+    /// Progresses the state of the given proxy connection by attempting each of the following operations once,
     /// in order:
-    /// 
+    ///
     /// 1. Connecting to the database via TCP (if not connected)
     /// 2. Processing any data received from the client and validating any SQL query contained within it using `validator` (if connected)
     /// 3. Forwarding data received from the client to the backend database (if connected)
     ///
     /// Returns a tuple indicating the read/write events needed on the proxy's client socket and database socket (in that order).
-    /// 
-    pub fn process_incoming(&mut self, validator: &mut SqlValidator<T>) -> io::Result<(IOEvent,IOEvent)> {
+    ///
+    pub fn process_incoming(
+        &mut self,
+        validator: &mut SqlValidator<T>,
+    ) -> io::Result<(IOEvent, IOEvent)> {
         let (mut client_ev, mut db_ev) = (IOEvent::None, IOEvent::None);
 
         /*
@@ -169,32 +172,35 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
                 Ok(()) => IOEvent::None,
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Read,
-                    _ => return Err(e)
-                }
+                    _ => return Err(e),
+                },
             };
 
             db_ev |= match self.proxy_client_packet() {
                 Ok(()) => IOEvent::None,
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Write,
-                    _ => return Err(e)
-                }
+                    _ => return Err(e),
+                },
             };
         }
 
         Ok((client_ev, db_ev))
     }
 
-    /// Progresses the state of the given proxy connection by attempting each of the following operations once, 
+    /// Progresses the state of the given proxy connection by attempting each of the following operations once,
     /// in order:
-    /// 
+    ///
     /// 1. Connecting to the database via TCP (if not connected)
     /// 2. Processing any data received from the backend database and updating `validator` based on SQL query response (if connected)
     /// 3. Forwarding data received from the database to the client (if connected)
     ///
     /// Returns a tuple indicating the read/write events needed on the proxy's client socket and database socket (in that order).
-    /// 
-    pub fn process_outgoing(&mut self, validator: &mut SqlValidator<T>) -> io::Result<(IOEvent,IOEvent)> {
+    ///
+    pub fn process_outgoing(
+        &mut self,
+        validator: &mut SqlValidator<T>,
+    ) -> io::Result<(IOEvent, IOEvent)> {
         let (mut client_ev, mut db_ev) = (IOEvent::None, IOEvent::None);
 
         /*
@@ -212,7 +218,7 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
             db_ev |= self.connect_db_tls()?;
         }
         */
-        
+
         if self.state == ConnectionState::Connected {
             // Only go through one round of each phase to ensure fairness at the EventHandler layer
 
@@ -220,16 +226,16 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
                 Ok(()) => IOEvent::None,
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Read,
-                    _ => return Err(e)
-                }
+                    _ => return Err(e),
+                },
             };
 
             client_ev |= match self.proxy_db_packet(validator) {
                 Ok(()) => IOEvent::None,
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Write,
-                    _ => return Err(e)
-                }
+                    _ => return Err(e),
+                },
             };
         }
 
@@ -237,15 +243,15 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
     }
 
     /// Attempts to establish a proxy connection to the backend database.
-    /// 
+    ///
     fn connect_database(&mut self) -> io::Result<IOEvent> {
         match self.get_db_socket().connect(&self.db_address) {
             Ok(_) => {
                 self.state = ConnectionState::Connected;
                 Ok(IOEvent::None)
-            },
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(IOEvent::Read), // TODO: check which event to poll for
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
@@ -255,44 +261,75 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
                 self.get_db_socket().shutdown(net::Shutdown::Write)?; // No more data to process, so close other half of the incoming stream
                 self.db_write_closed = true;
             }
-            return Ok(())
+            return Ok(());
         }
 
-        let request = match self.sql_session.server_receive_request() {
+        if self.incoming_data.len() >= BUFFER_SOFT_LIMIT {
+            return Ok(()); // Defer receiving requests until the buffer has had time to be drained
+        }
+
+        let mut request = match self.sql_session.frontend_receive_request() {
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                 self.client_read_closed = true; // TODO: make sure that the socket actually has `shutdown()` called on it in the appropriate location
-                return Ok(())
-            },
-            Err(e) => return Err(e)
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
 
-        let req_info = request.get_basic_info();
-        if let Some(query) = &req_info.query {
+        if request.get_basic_info().gssenc_requested {
+            if let Some(resp) = self.sql_session.frontend_downgrade_gssenc(&mut request) {
+                self.outgoing_data.push_back(resp);
+            }
+
+            if !request.is_valid() {
+                return Ok(());
+            }
+        }
+
+        if request.get_basic_info().ssl_requested {
+            if let Some(resp) = self.sql_session.frontend_downgrade_ssl(&mut request) {
+                self.outgoing_data.push_back(resp);
+            }
+
+            if !request.is_valid() {
+                return Ok(());
+            }
+        }
+
+        if let Some(query) = request.get_basic_info().query.as_ref() {
             match validator.check_query(query.as_str()) {
-                Err(_) => self.request_queue.push_back(PacketInfo { query: Some(query.clone()), is_malicious: true }), // Don't forward request data, don't want the db to run a malicious query
+                Err(_) => self.request_queue.push_back(RequestMetadata {
+                    query: Some(query.clone()),
+                    is_malicious: true,
+                }), // Don't forward request data, don't want the db to run a malicious query
                 Ok(()) => {
-                    self.request_queue.push_back(PacketInfo { query: Some(query.clone()), is_malicious: false });
+                    self.request_queue.push_back(RequestMetadata {
+                        query: Some(query.clone()),
+                        is_malicious: false,
+                    });
                     self.incoming_data.push_back(request);
-                },
+                }
             }
         } else {
-            if req_info.is_request {
-                self.request_queue.push_back(PacketInfo { query: None, is_malicious: false });
+            if request.get_basic_info().is_request {
+                self.request_queue.push_back(RequestMetadata {
+                    query: None,
+                    is_malicious: false,
+                });
             }
+
             self.incoming_data.push_back(request);
         }
 
-        // TODO: handle SSL and GSSENC requests HERE
-
         Ok(())
     }
-        
+
     fn proxy_client_packet(&mut self) -> io::Result<()> {
         assert!(!self.db_write_closed); // NOTE: this should never be reached based on how we've architected our event handler
 
         if let Some(request) = self.incoming_data.pop_front() {
-            match self.sql_session.client_send_request(&request) {
+            match self.sql_session.backend_send_request(&request) {
                 Ok(()) => self.sql_session.recycle_request(request),
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                     self.db_write_closed = true; // TODO: make sure that the socket actually has `shutdown()` called on it in the appropriate location
@@ -300,10 +337,10 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
                     return self.get_client_socket().shutdown(net::Shutdown::Read);
                     // No sense pushing the incoming request back onto the stack--there'll be no way to send it anyways
                     // TODO: make sure the number of responses we expect from the server are correct in this edge case
-                },
+                }
                 Err(e) => {
                     self.incoming_data.push_front(request); // Could be a recoverable error, such as EWOULDBLOCK
-                    return Err(e)
+                    return Err(e);
                 }
             }
         }
@@ -313,58 +350,60 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
 
     fn process_db_packet(&mut self) -> io::Result<()> {
         // If we have no more data to receive and none to to send, we should close the connection
-        if self.incoming_closed() && self.request_queue.is_empty() && self.outgoing_data.is_empty() {
+        if self.incoming_closed() && self.request_queue.is_empty() && self.outgoing_data.is_empty()
+        {
             self.get_client_socket().shutdown(net::Shutdown::Write)?;
-            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection gracefully terminated (no more packets to read in from client or process)"))
-            // TODO: do we want to notify the proxy to stop through a ConnectionAborted error here, even though it was a graceful termination?
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection gracefully terminated (no more packets to read in from client or process)"));
         }
 
         if self.db_read_closed {
-            return Ok(()) // We're not going to receive any new packets, so stop here
+            return Ok(()); // We're not going to receive any new packets, so stop here
         }
 
         while let Some(request_info) = self.request_queue.pop_front() {
             if request_info.is_malicious {
-                // TODO: inject artificial error packet to output queue here
+                self.outgoing_data
+                    .push_back(self.sql_session.error_response());
             } else {
                 self.request_queue.push_front(request_info);
-                break
+                break;
             }
         }
 
-        // TODO: if not too many packets in outgoing_data queue
-        self.outgoing_data.push_back(match self.sql_session.client_receive_response() {
-            Ok(resp) => resp,
+        if self.outgoing_data.len() >= BUFFER_SOFT_LIMIT {
+            return Ok(()); // Defer receiving responses until the buffer has had time to be drained
+        }
+
+        match self.sql_session.backend_receive_response() {
+            Ok(resp) => self.outgoing_data.push_back(resp),
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                 self.db_read_closed = true;
                 self.db_write_closed = true;
                 self.client_read_closed = true; // If we can't get data from our db, no sense in accepting new data from our client
                 self.get_client_socket().shutdown(net::Shutdown::Read)?; // TODO: make sure we close the write end of our db socket regardless of failure here??
                 self.get_db_socket().shutdown(net::Shutdown::Write)?;
-                return Ok(())
-            },
-            Err(e) => return Err(e)
-        });
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
 
         Ok(())
     }
 
-    fn proxy_db_packet(&mut self, validator: &mut SqlValidator<T>) -> io::Result<()> {   
-
-
+    fn proxy_db_packet(&mut self, validator: &mut SqlValidator<T>) -> io::Result<()> {
         while let Some(response) = self.outgoing_data.pop_front() {
-            match self.sql_session.server_send_response(&response) {
+            match self.sql_session.frontend_send_response(&response) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                    // Close proxy gracefully
+                    // Close proxy according to TCP spec
                     self.get_db_socket().shutdown(net::Shutdown::Write)?;
                     self.get_db_socket().shutdown(net::Shutdown::Read)?;
                     self.get_client_socket().shutdown(net::Shutdown::Read)?;
-                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "client unexpectedly closed connection despite data remaining to be returned"))
-                },
+                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "client unexpectedly closed connection despite data remaining to be returned"));
+                }
                 Err(e) => {
-                    self.outgoing_data.push_front(response); // Could be a recoverable error, such as EWOULDBLOCK
-                    return Err(e)
+                    self.outgoing_data.push_front(response); // Could be a recoverable error, such as EWOULDBLOCK--we simply forward it
+                    return Err(e);
                 }
             }
 
@@ -373,25 +412,30 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> Proxy<T, P> {
                     // We presume that no SQL queries coming from an application will trigger errors by default.
                     // Thus, the presence of an error potentially indicates the introduction of additional command syntax (i.e. SQL Injection)
                     match (request_info.query, was_successful) {
-                        (Some(query), true) => validator.update_good_query(query.clone()),
-                        (Some(query), false) => validator.update_bad_query(query.clone()),
-                        _ => () // some other non-query request (e.g. a FunctionCall)
+                        (Some(query), true) => validator.update_good_query(query.as_str()),
+                        (Some(query), false) => validator.update_bad_query(query.as_str()),
+                        _ => (), // some other non-query request (e.g. a FunctionCall)
                     }
                 } else {
                     // Somehow, we received one more response from the database than what we were expecting. This is BAD (as it could lead to erroneous data and errors being passed to the application, not to mention request smuggling...)
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "proxy request/response flow became desynchronized--aborting connection"))
-                    // TODO: make sure this errorkind (InvalidData) doesn't conflict with others
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "proxy request/response flow became desynchronized",
+                    ));
                 }
             }
 
             self.sql_session.recycle_response(response);
-            return Ok(())
+            return Ok(());
         }
 
         // Successfully wrote all remaining data from buffers, so connection can be closed
         if self.db_read_closed {
-            self.get_client_socket().shutdown(net::Shutdown::Write)?; // TODO: here, or in SqlSession?
-            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection gracefully terminated (no more packets from database)"))
+            self.get_client_socket().shutdown(net::Shutdown::Write)?;
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection gracefully terminated (no more packets from database)",
+            ));
         }
 
         Ok(())
