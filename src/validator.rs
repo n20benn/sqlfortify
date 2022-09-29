@@ -67,7 +67,6 @@ impl<T: SqlToken> SqlValidator<T> {
         println!("Tokenized query into: {:?}", &tokens);
 
         let prefix = self.matcher.match_prefix(tokens.as_ref());
-        let mut suffix = None;
 
         if let Some(prefix_info) = prefix {
             // First, accept queries that have been seen before (even if a parameter is later detected to be vulnerable)
@@ -82,7 +81,7 @@ impl<T: SqlToken> SqlValidator<T> {
 
             // And if neither of these cases fit, do another O(n) scan on the query to get suffix information
             let reverse_tokens = T::scan_reverse(query);
-            suffix = self.matcher.match_suffix(&reverse_tokens, &prefix_info);
+            let suffix = self.matcher.match_suffix(&reverse_tokens, &prefix_info);
 
             // TODO: all of the control flow paths below check the entire SQL query. We could just check whatever is between the prefix & suffix...
             // Won't do for now, since it's O(n) as it stands
