@@ -1,5 +1,5 @@
 use super::token::SqlToken;
-use hashbrown::{hash_map::Entry, HashMap, HashSet}; // Switch to std HashMap once get_key_value_mut and try_insert are implemented
+use hashbrown::{hash_map::Entry, HashMap}; // Switch to std HashMap once get_key_value_mut and try_insert are implemented
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeID {
@@ -26,7 +26,7 @@ impl IDCounter {
 
 struct Node<T: SqlToken> {
     id: NodeID,
-    next_param_ids: HashSet<NodeID>,
+    next_param_id: Option<NodeID>,
     is_valid_pattern: bool,
     is_vuln_prefix: bool,
     is_constant: bool,
@@ -37,7 +37,7 @@ impl<T: SqlToken> Node<T> {
     fn new(id: NodeID) -> Self {
         Self {
             id: id,
-            next_param_ids: HashSet::new(),
+            next_param_id: None,
             is_valid_pattern: false,
             is_vuln_prefix: false,
             is_constant: true,
@@ -51,10 +51,6 @@ impl<T: SqlToken> Node<T> {
 
     fn get_child_mut(&mut self, token: &T) -> Option<&mut Node<T>> {
         self.next.get_mut(token)
-    }
-
-    fn get_key_value(&self, token: &T) -> Option<(&T, &Node<T>)> {
-        self.next.get_key_value(token)
     }
 
     fn get_key_value_mut(&mut self, token: &T) -> Option<(&T, &mut Node<T>)> {
@@ -98,10 +94,25 @@ impl<T: SqlToken> Node<T> {
     }
 }
 
+pub struct NodeInfo<'a, T: SqlToken> {
+    node: &'a Node<T>,
+    pub absolute_index: usize,
+    pub directional_index: usize,
+    pub is_exact_match: bool,
+    pub has_vuln_prefix: bool,
+}
+
+impl<'a, T: SqlToken> NodeInfo<'a, T> {
+    pub fn get_id(&self) -> NodeID {
+        self.node.id
+    }
+}
+
 pub struct SqlMatcher<T: SqlToken> {
     fwd_root: Node<T>, // Empty node to make traversal more easy
     rev_root: Node<T>, // ditto
     id_counter: IDCounter,
+    // Settings for check strictness can be stored in here (and passed in on new())
 }
 
 impl<T: SqlToken> SqlMatcher<T> {
@@ -114,17 +125,22 @@ impl<T: SqlToken> SqlMatcher<T> {
         }
     }
 
-    /// Returns the indices of the end of the prefix/beginning of the suffix of a given past seen query, if any such query matches.
-    pub fn get_prefix_suffix_indices(&self, sql_query: &Vec<T>) -> Option<(usize, Option<usize>)> {
-        // let param_tokens = T::param_tokens();
+    pub fn match_prefix<'a>(&'a self, forward_tokens: &Vec<(T, usize)>) -> Option<NodeInfo<'a, T>> {
         let mut last_param_parent_node: Option<&Node<T>> = None;
         let mut node = &self.fwd_root;
-        let mut fwd_idx = 0; 
+        let mut prefix_index = 0;
+        let mut absolute_index = 0;
+        let mut has_vuln_prefix = false;
 
-        for (idx, token) in sql_query.iter().enumerate() {
-            if !node.next_param_ids.is_empty() {
+        for (idx, (token, abs_idx)) in forward_tokens.iter().enumerate() {
+            if !node.next_param_id.is_none() {
                 last_param_parent_node = Some(node);
-                fwd_idx = idx;
+                prefix_index = idx;
+                absolute_index = *abs_idx;
+            }
+
+            if node.is_vuln_prefix {
+                has_vuln_prefix = true;
             }
 
             node = match node.get_child(token) {
@@ -132,172 +148,129 @@ impl<T: SqlToken> SqlMatcher<T> {
                 None => break, // Prefix found
             };
 
-            if idx + 1 == sql_query.len() {
-                return Some((idx + 1, Some(idx + 1)))
+            if idx == forward_tokens.len() - 1 && node.is_valid_pattern {
+                // All of the tokens have been traversed--it's an exact match
+                return Some(NodeInfo {
+                    node: node, // NOTE: this isn't technically the right node, but we don't use it anyway when node.is_valid_pattern == true
+                    absolute_index: *abs_idx,
+                    directional_index: idx,
+                    is_exact_match: node.is_valid_pattern,
+                    has_vuln_prefix: has_vuln_prefix,
+                });
             }
         }
-        
-        // If we don't have a prefix, what's the point of searching for a suffix...
-        let curr_param_parent_node = match last_param_parent_node {
-            Some(n) => n,
-            None => return None,
+
+        match last_param_parent_node {
+            Some(node) => Some(NodeInfo {
+                node: node,
+                absolute_index: absolute_index,
+                directional_index: prefix_index,
+                is_exact_match: false,
+                has_vuln_prefix: has_vuln_prefix,
+            }),
+            None => None,
+        }
+    }
+
+    pub fn match_suffix<'a>(
+        &'a self,
+        reverse_tokens: &Vec<(T, usize)>,
+        prefix: &'a NodeInfo<T>,
+    ) -> Option<NodeInfo<'a, T>> {
+        let fwd_param_id = match prefix.node.next_param_id {
+            Some(id) => id,
+            None => return None, // NOTE: this should never be the case, as `match_prefix()` only returns nodes with a `next_param_id`
         };
 
-        let mut rev_idx = None;
-        node = &self.rev_root;
-
-        for (idx, token) in sql_query.iter().rev().take(sql_query.len() - (fwd_idx + 1)).enumerate() {
-            if !node.next_param_ids.is_disjoint(&curr_param_parent_node.next_param_ids) {
-                rev_idx = Some(sql_query.len() - idx);
+        let mut suffix = None;
+        let mut node = &self.rev_root;
+        for (suffix_idx, (token, abs_idx)) in reverse_tokens.iter().enumerate() {
+            if *abs_idx <= prefix.absolute_index {
+                break; // If the suffix overlaps with the prefix, we stop
             }
 
-            node = match node.get_child(token) {
-                Some(i) => i,
-                None => break,
-            }
-        }
-
-        Some((fwd_idx, rev_idx))
-    }
-
-    pub fn is_exact_match(&self, sql_query: &Vec<T>) -> bool {
-        let mut node = &self.fwd_root;
-
-        for token in sql_query.iter() {
-            node = match node.get_child(token) {
-                Some(i) => i,
-                None => return false,
-            };
-        }
-
-        node.is_valid_pattern
-    }
-
-    pub fn match_prefix_suffix(&self, sql_query: &Vec<T>) -> HashSet<NodeID> {
-        // let param_tokens = T::param_tokens();
-        let mut last_param_parent_node: Option<&Node<T>> = None;
-        let mut node = &self.fwd_root;
-        let mut fwd_count = 0; 
-
-        for (idx, token) in sql_query.iter().enumerate() {
-            if !node.next_param_ids.is_empty() {
-                last_param_parent_node = Some(node);
-                fwd_count = idx + 1;
+            if prefix.node.next_param_id == Some(fwd_param_id) {
+                // We want the longest suffix, so we overwrite past suffix matches here
+                suffix = Some(NodeInfo {
+                    node: node,
+                    absolute_index: *abs_idx,
+                    directional_index: suffix_idx,
+                    is_exact_match: false,
+                    has_vuln_prefix: false,
+                });
             }
 
             node = match node.get_child(token) {
                 Some(n) => n,
                 None => break, // Prefix found
             };
-
         }
 
-        // If we don't have a prefix, what's the point of searching for a suffix...
-        let curr_param_parent_node = match last_param_parent_node {
-            Some(n) => n,
-            None => return HashSet::new(),
-        };
-
-        let fwd_param_ids = &curr_param_parent_node.next_param_ids;
-        let mut rev_param_ids: HashSet<NodeID> = HashSet::new();
-
-        node = &self.rev_root;
-        for token in sql_query.iter().rev().take(sql_query.len() - fwd_count) {
-            rev_param_ids.extend(node.next_param_ids.iter()); // TODO: if parameters are all one type, it would be much more efficient...
-
-            node = match node.get_child(token) {
-                Some(i) => i,
-                None => break,
-            }
-        }
-
-        HashSet::from_iter(rev_param_ids.intersection(&fwd_param_ids).cloned())
+        suffix
     }
 
-    pub fn match_prefix(&self, sql_query: &Vec<T>) -> HashSet<NodeID> {
-        // let param_tokens = T::param_tokens();
-
-        let mut last_param_node: Option<&Node<T>> = None;
-        let mut node = &self.fwd_root;
-
-        for token in sql_query.iter() {
-            if !node.next_param_ids.is_empty() {
-                last_param_node = Some(node);
-            }
-
-            node = match node.get_child(token) {
-                Some(i) => i,
-                None => break,
-            };
-        }
-
-        match last_param_node {
-            Some(node) => node.next_param_ids.clone(),
-            None => HashSet::new(),
-        }
-    }
-
-    pub fn mark_vuln(&mut self, sql_query: &Vec<T>, node_ids: &HashSet<NodeID>) {
+    pub fn mark_vuln(&mut self, sql_query: &Vec<(T, usize)>, vuln_prefix_id: Option<NodeID>) {
         let mut node = &mut self.fwd_root;
+        match vuln_prefix_id {
+            Some(vuln_id) => {
+                for (token, _) in sql_query.iter() {
+                    if let Some(id) = node.next_param_id.as_ref() {
+                        if *id == vuln_id {
+                            node.is_vuln_prefix = true;
+                            return;
+                        }
+                    }
 
-        /*
-        if node_ids.is_empty() {
-            self.fwd_root.is_vuln_prefix = true;
-            return
-        }
-        */
+                    if node.get_child(token).is_none() {
+                        node.is_vuln_prefix = true; // Should never happen...
+                    }
 
-        for token in sql_query.iter() {
-            if !node.next_param_ids.is_disjoint(node_ids) {
+                    node = match node.get_child_mut(token) {
+                        Some(next_node) => next_node,
+                        None => return,
+                    }
+                }
+            }
+            None => {
+                // Go until first parameter is found, then mark that prefix as vulnerable
+                for (token, _) in sql_query.iter() {
+                    if token.is_param_token() {
+                        node.is_vuln_prefix = true;
+                        return;
+                    }
+
+                    // Go to next node, creating it if it doesn't exist
+                    node = node.get_child_update(token.clone(), &mut self.id_counter);
+                }
+
                 node.is_vuln_prefix = true;
             }
-
-            node = match node.get_child_mut(token) {
-                Some(i) => i,
-                None => return,
-            };
         }
-    }
-
-    pub fn has_vuln(&self, sql_query: &Vec<T>) -> bool {
-        let mut node = &self.fwd_root;
-
-        for token in sql_query.iter() {
-            if node.is_vuln_prefix {
-                return true;
-            }
-
-            node = match node.get_child(token) {
-                Some(i) => i,
-                None => break,
-            };
-        }
-
-        false
     }
 
     // If pattern already exists, just updates is_constant values.
     // Could also name insert()
-    pub fn update_pattern(&mut self, sql_query: Vec<T>) {
+    pub fn update_pattern(&mut self, sql_query: Vec<(T, usize)>) {
         let token_id_pairs = self.update_fwd_tree(sql_query);
         self.update_rev_tree(token_id_pairs);
     }
 
     // Consumes the vector of tokens and produces a vector of
     // tuples with those tokens (and NodeIDs) to use
-    fn update_fwd_tree(&mut self, sql_query: Vec<T>) -> Vec<(T, NodeID)> {
+    fn update_fwd_tree(&mut self, sql_query: Vec<(T, usize)>) -> Vec<(T, NodeID)> {
         let mut node = &mut self.fwd_root;
         let mut fwd_nodes = vec![];
 
         // Consume each token and traverse tree, adding/updating nodes as needed
-        for token in sql_query.into_iter() {
+        for (token, _) in sql_query.into_iter() {
             match node.next.get_key_value_mut(&token) {
                 Some((existing_token, next_node)) => {
                     // We already know token == existing token; just check deep_eq
 
                     if token.is_param_token() && !token.deep_eq(existing_token) {
                         next_node.is_constant = false;
-                        node.next_param_ids.insert(next_node.id.clone());
+                        node.next_param_id = Some(next_node.id);
+                        // node.next_param_id.insert(next_node.id);
                     }
                 }
                 None => (),
@@ -327,7 +300,8 @@ impl<T: SqlToken> SqlMatcher<T> {
                 Some((existing_token, next_node)) => {
                     if token.is_param_token() && !token.deep_eq(existing_token) {
                         next_node.is_constant = false;
-                        node.next_param_ids.insert(node_id);
+                        node.next_param_id = Some(node_id);
+                        // node.next_param_id.insert(node_id);
                     }
                 }
                 None => (),

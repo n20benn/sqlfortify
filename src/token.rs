@@ -1,8 +1,10 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
+pub struct CheckParameters {}
+
 // Note: this trait is meant to work especially well with Enums
-pub trait SqlToken: Eq + Hash + Clone + Debug {
+pub trait SqlToken: Eq + Hash + Clone + Debug + Display {
     // Trait Eq should evaluate true if two tokens are the same type.
     // Make sure Hash is implemented so that k1 == k2 -> hash(k1) == hash(k2)
     // deep_eq should evaluate true if two tokens have the same contents.
@@ -25,6 +27,7 @@ pub trait SqlToken: Eq + Hash + Clone + Debug {
     // would evaluate to false, thus giving us the information we need to declare the
     // node to be a user-modifiable parameter.
 
+    /// This MUST only be true for one token type. In other words, (t1.is_param_token() && t2.is_param_token()) => (t1 == t2)--though t1 doesn't have to deep_eq() t2.
     fn is_param_token(&self) -> bool;
 
     fn is_whitespace(&self) -> bool;
@@ -36,11 +39,18 @@ pub trait SqlToken: Eq + Hash + Clone + Debug {
     // It makes better sense to have all scanning/parsing code that
     // is specific to a given token within the token's file (or else
     // referenced directly by the token's file).
-    fn scan_from(query: &str) -> Vec<Self>;
+    fn scan_forward(query: &str) -> Vec<(Self, usize)>;
+
+    fn scan_reverse(query: &str) -> Vec<(Self, usize)>;
 
     // Could do the same for parsing, but should probably put in
     // its own module (since it won't use these tokens)
     //  fn parse(query:&str) -> Result<>;
 
-    fn is_malicious_query(pattern: &Vec<Self>) -> bool;
+    fn is_malicious_query<'a, I: std::iter::DoubleEndedIterator<Item = &'a Self> + Clone>(
+        query_iter: I,
+        checks: &CheckParameters,
+    ) -> bool
+    where
+        Self: 'a;
 }

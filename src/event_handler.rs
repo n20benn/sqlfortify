@@ -6,6 +6,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use std::{error, fmt, io};
 
+use crate::token::CheckParameters;
+
 use super::key_pool::KeyPool;
 use super::proxy::{IOEvent, Proxy};
 use super::token::SqlToken;
@@ -56,7 +58,11 @@ pub struct EventHandler<T: SqlToken, P: ProxySession<Socket, Socket>> {
 }
 
 impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
-    pub fn new(listen_address: SockAddr, db_address: SockAddr) -> Result<Self, HandlerError> {
+    pub fn new(
+        listen_address: SockAddr,
+        db_address: SockAddr,
+        sql_check_params: CheckParameters,
+    ) -> Result<Self, HandlerError> {
         let listener = create_listener(&listen_address)?;
         let poller = Poller::new()?;
         let mut pool = KeyPool::new();
@@ -70,7 +76,7 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
             poller: poller,
             proxies: HashMap::new(),
             db_key_map: HashMap::new(),
-            validator: SqlValidator::new(),
+            validator: SqlValidator::new(sql_check_params),
         })
     }
 

@@ -1,5 +1,6 @@
-use super::token::SqlToken;
+use super::token::*;
 use phf::phf_map;
+use std::fmt::{Display, Write};
 use std::hash::{Hash, Hasher};
 
 // Derived from https://www.cockroachlabs.com/docs/stable/sql-grammar.html
@@ -8,50 +9,30 @@ use std::hash::{Hash, Hasher};
 
 // Full scanner described here: https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/scanner_test.go
 
-// e'' and E'' act to escape characters (so e'\x41' => A)
 #[derive(Clone, Debug)]
 pub enum CockroachToken {
     UnknownToken(char),
     Identifier(String), // must: begin with underscore?; subsequent alphanumeric, underscores, or dollar signs. Double-quotes bypass these rules and preserves case sensitivity. Examples include asdf and "asdf", as well as $asdf
-    Sconst(String), // looks like 'asdf' or $a$sd$a$ or e'asdf', E'asdf', or $$~!@#$%^&*()_+:",./<>?;'$$
-    Bconst(String), // byte constant; looks like b'a' or b'\xff' (we don't enforce contents)
-    Bitconst(String), // bit constant; looks like B'10101' (we don't enforce contents)
-    Iconst(String), // looks like 1, 0xa, x'2F', 000, 0xff, 08, 1..2, 9223372036854775809 (2^63+1)
-    Fconst(String), // looks like 1.0e1, 1e+1, 1e-1, 1., .1, 1.2, 1.2e3, 1e3
+    SingleQuote,
+    DollarQuote(String),
+    Const(String),
     Placeholder(String), // looks like $1, must be betweeen 1 and 65536 (we don't enforce)
     Keyword(Keyword),
     Symbol(char), // Characters that form unary/binary operators
-    LineComment(String),
-    BlockComment(String),
+    LineComment,
+    BlockCommentOpen,
+    BlockCommentClose,
     Whitespace(char),
 }
 
-/*
-#[derive(Clone, Debug)]
-pub enum CockroachToken {
-    UnknownToken(char),
-    Identifier(String), // must: begin with underscore?; subsequent alphanumeric, underscores, or dollar signs. Double-quotes bypass these rules and preserves case sensitivity. Examples include asdf and "asdf", as well as $asdf
-	SingleQuote(Option<char>),
-	DollarQuote(String),
-	Const(String),
-
-    Sconst(String), // looks like 'asdf' or $a$sd$f$ or e'asdf', E'asdf', or $$~!@#$%^&*()_+:",./<>?;'$$
-    Bconst(String), // byte constant; looks like b'a' or b'\xff' (we don't enforce contents)
-    Bitconst(String), // bit constant; looks like B'10101' (we don't enforce contents)
-    Iconst(String), // looks like 1, 0xa, x'2F', 000, 0xff, 08, 1..2, 9223372036854775809 (2^63+1)
-    Fconst(String), // looks like 1.0e1, 1e+1, 1e-1, 1., .1, 1.2, 1.2e3, 1e3
-    Placeholder(String), // looks like $1, must be betweeen 1 and 65536 (we don't enforce)
-    Keyword(Keyword),
-    Symbol(char), // Characters that form unary/binary operators
-    LineComment(String),
-    BlockComment(String),
-    Whitespace(char),
+#[derive(PartialEq, Eq)]
+enum ScanDirection {
+    Forward,
+    Reverse,
 }
-*/
-
 
 // These are all accepted keywords
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Display)]
 pub enum Keyword {
     Analyze,
     Analyse,
@@ -1276,24 +1257,16 @@ impl PartialEq for CockroachToken {
                 CockroachToken::Identifier(i2) => i1 == i2,
                 _ => false,
             },
-            CockroachToken::Sconst(_) => match other {
-                CockroachToken::Sconst(_) => true,
+            CockroachToken::Const(_) => match other {
+                CockroachToken::Const(_) => true,
                 _ => false,
             },
-            CockroachToken::Bconst(_) => match other {
-                CockroachToken::Bconst(_) => true,
+            CockroachToken::SingleQuote => match other {
+                CockroachToken::SingleQuote => true,
                 _ => false,
             },
-            CockroachToken::Bitconst(_) => match other {
-                CockroachToken::Bitconst(_) => true,
-                _ => false,
-            },
-            CockroachToken::Iconst(_) => match other {
-                CockroachToken::Iconst(_) => true,
-                _ => false,
-            },
-            CockroachToken::Fconst(_) => match other {
-                CockroachToken::Fconst(_) => true,
+            CockroachToken::DollarQuote(id1) => match other {
+                CockroachToken::DollarQuote(id2) => id1 == id2,
                 _ => false,
             },
             CockroachToken::Placeholder(p1) => match other {
@@ -1304,12 +1277,16 @@ impl PartialEq for CockroachToken {
                 CockroachToken::Keyword(k2) => k1 == k2,
                 _ => false,
             },
-            CockroachToken::LineComment(l1) => match other {
-                CockroachToken::LineComment(l2) => l1 == l2,
+            CockroachToken::LineComment => match other {
+                CockroachToken::LineComment => true,
                 _ => false,
             },
-            CockroachToken::BlockComment(b1) => match other {
-                CockroachToken::BlockComment(b2) => b1 == b2,
+            CockroachToken::BlockCommentOpen => match other {
+                CockroachToken::BlockCommentOpen => true,
+                _ => false,
+            },
+            CockroachToken::BlockCommentClose => match other {
+                CockroachToken::BlockCommentClose => true,
                 _ => false,
             },
             CockroachToken::Symbol(c1) => match other {
@@ -1342,19 +1319,21 @@ impl Hash for CockroachToken {
                 state.write_u8(3);
                 s.hash(state);
             }
-            CockroachToken::Sconst(_) => {
+            CockroachToken::Const(_) => {
                 state.write_u8(4);
+                // Don't want to hash this--use deep_eq instead
             }
-            CockroachToken::Bconst(_) => {
+            CockroachToken::SingleQuote => {
                 state.write_u8(5);
             }
-            CockroachToken::Bitconst(_) => {
+            CockroachToken::DollarQuote(id) => {
                 state.write_u8(6);
+                id.hash(state);
             }
-            CockroachToken::Iconst(_) => {
+            CockroachToken::BlockCommentOpen => {
                 state.write_u8(7);
             }
-            CockroachToken::Fconst(_) => {
+            CockroachToken::BlockCommentClose => {
                 state.write_u8(8);
             }
             CockroachToken::Placeholder(s) => {
@@ -1369,47 +1348,54 @@ impl Hash for CockroachToken {
                 state.write_u8(11);
                 s.hash(state);
             }
-            CockroachToken::LineComment(s) => {
+            CockroachToken::LineComment => {
                 state.write_u8(12);
-                s.hash(state);
-            }
-            CockroachToken::BlockComment(s) => {
-                state.write_u8(13);
-                s.hash(state);
             }
         };
     }
 }
 
+impl Display for CockroachToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CockroachToken::UnknownToken(c)
+            | CockroachToken::Whitespace(c)
+            | CockroachToken::Symbol(c) => write!(f, "{}", c),
+            CockroachToken::Identifier(s) => write!(f, "{}", s),
+            CockroachToken::SingleQuote => write!(f, "'"),
+            CockroachToken::DollarQuote(id) => write!(f, "${}$", id),
+            CockroachToken::Const(s) => write!(f, "{}", s),
+            CockroachToken::Placeholder(s) => write!(f, "{}", s),
+            CockroachToken::LineComment => write!(f, "--"),
+            CockroachToken::BlockCommentOpen => write!(f, "/*"),
+            CockroachToken::BlockCommentClose => write!(f, "*/"),
+            CockroachToken::Keyword(k) => write!(f, "{}", k),
+        }
+    }
+}
+
 impl SqlToken for CockroachToken {
+    fn scan_forward(query: &str) -> Vec<(Self, usize)> {
+        Self::scan_with_parameters(query, ScanDirection::Forward)
+    }
+
+    fn scan_reverse(query: &str) -> Vec<(Self, usize)> {
+        Self::scan_with_parameters(query, ScanDirection::Reverse)
+    }
+
     fn deep_eq(&self, other: &Self) -> bool {
         (self == other)
-            && match self {
-                CockroachToken::Sconst(s1)
-                | CockroachToken::Bconst(s1)
-                | CockroachToken::Bitconst(s1)
-                | CockroachToken::Iconst(s1)
-                | CockroachToken::Fconst(s1) => match other {
-                    CockroachToken::Sconst(s2)
-                    | CockroachToken::Bconst(s2)
-                    | CockroachToken::Bitconst(s2)
-                    | CockroachToken::Iconst(s2)
-                    | CockroachToken::Fconst(s2) => s1 == s2,
-                    _ => false,
-                },
+            && match (self, other) {
+                (CockroachToken::Const(s1), CockroachToken::Const(s2)) => s1 == s2,
                 _ => true,
             }
     }
 
-	// TODO: IF we don't enforce the contents of any of these tokens, why not just merge them into one token type?
-	// That way, we can remove the whole hashmap difficulties we see in matcher.rs and the algorithm becomes guaranteed O(n)
+    // TODO: IF we don't enforce the contents of any of these tokens, why not just merge them into one token type?
+    // That way, we can remove the whole hashmap difficulties we see in matcher.rs and the algorithm becomes guaranteed O(n)
     fn is_param_token(&self) -> bool {
         match self {
-            CockroachToken::Sconst(_)
-            | CockroachToken::Bconst(_)
-            | CockroachToken::Bitconst(_)
-            | CockroachToken::Iconst(_)
-            | CockroachToken::Fconst(_) => true,
+            CockroachToken::Const(_) => true,
             _ => false,
         }
     }
@@ -1421,7 +1407,43 @@ impl SqlToken for CockroachToken {
         }
     }
 
-    fn scan_from(query: &str) -> Vec<Self> {
+    // Currently covers:
+    // - Injected semicolons
+    // - Injected comments
+    fn is_malicious_query<'a, I: std::iter::DoubleEndedIterator<Item = &'a Self> + Clone>(
+        mut query_iter: I,
+        checks: &CheckParameters,
+    ) -> bool
+    where
+        Self: 'a,
+    {
+        while let Some(token) = query_iter.next() {
+            match token {
+                CockroachToken::Symbol(';')
+                | CockroachToken::LineComment
+                | CockroachToken::BlockCommentOpen => return true,
+                CockroachToken::Identifier(_) => {
+                    // Block metadata tables here
+                    // Block file/socket/exec functions here?
+                }
+                CockroachToken::Keyword(Keyword::Or) => {
+                    if is_tautology(query_iter.clone()) {
+                        return true;
+                    }
+                }
+                // TODO: Add Keyword::And here to checks for (negative) tautology immediately following 'AND'?
+                CockroachToken::Keyword(Keyword::Union) => {}
+                // Maybe someday add logic to see whether a UNION JOIN is malicious
+                _ => (),
+            }
+        }
+
+        false
+    }
+}
+
+impl CockroachToken {
+    fn scan_without_parameters(query: &str) -> Vec<Self> {
         let mut iter = query.chars().peekable();
         let mut tokens = vec![];
 
@@ -1429,30 +1451,24 @@ impl SqlToken for CockroachToken {
             tokens.push(match (c, iter.peek()) {
                 ('-', Some('-')) => {
                     iter.next(); // consume '-'
-                    let mut comment = String::new();
-                    while let Some(c) = iter.next() {
-                        comment.push(c); // TODO: there's got to be some better way to do this?
-                    }
-                    CockroachToken::LineComment(comment)
+                    CockroachToken::LineComment
                 }
                 ('/', Some('*')) => {
                     iter.next(); // consume '*'
-                    match_block_comment(&mut iter)
+                    CockroachToken::BlockCommentOpen
                 }
-                ('\'', _) => match_apostraphe(&mut iter),
+                ('*', Some('/')) => {
+                    iter.next(); // consume '/'
+                    CockroachToken::BlockCommentClose
+                }
+                ('\'', _) => CockroachToken::SingleQuote,
                 ('"', _) => match_identifier_quot(&mut iter),
-                ('b', Some('\'')) => {
+                /*
+                (prefix @ ('b' | 'B' | 'x'), Some('\'')) => {
                     iter.next(); // consume '\''
-                    match_bconst(&mut iter)
+                    CockroachToken::SingleQuote(Some(prefix))
                 }
-                ('B', Some('\'')) => {
-                    iter.next(); // consume '\''
-                    match_bitconst(&mut iter)
-                }
-                ('x', Some('\'')) => {
-                    iter.next(); // consume '\''
-                    match_iconst_x(&mut iter)
-                }
+                */
                 ('.', Some('0'..='9')) => match_fconst_period(&mut iter, vec!['.']),
                 ('$', Some('0'..='9')) => match_placeholder(&mut iter),
                 ('$', Some(_)) => match_dollar_opening(&mut iter),
@@ -1469,60 +1485,140 @@ impl SqlToken for CockroachToken {
                     match_iconst_0x(&mut iter)
                 }
                 ('0'..='9', _) => match_const_digit(&mut iter, vec![c]),
-
-                /*
-                Identifier(String), // must: begin with underscore?; subsequent alphanumeric, underscores, or dollar signs. Double-quotes bypass these rules and preserves case sensitivity. Examples include asdf and "asdf", as well as $asdf
-                Sconst(String), // looks like 'asdf' or $a$sd$f$ or e'asdf', E'asdf', or $$~!@#$%^&*()_+:",./<>?;'$$
-                Iconst(String), // looks like 1, 0xa, x'2F', 000, 0xff, 08, 1..2, 9223372036854775809 (2^63+1)
-
-                            */
-                (c, _) => {
-                    if c.is_alphabetic() {
-                        match_kw_id(&mut iter, vec![c.to_ascii_uppercase()])
-                    // "SQL identifiers and key words must begin with a letter (a-z, but also letters with diacritical marks and non-Latin letters), or an underscore"
-                    } else {
-                        CockroachToken::UnknownToken(c)
-                    }
-                } // Not alphanumeric, and not any of the special chars we listed above: must be a Weasley
+                // "SQL identifiers and key words must begin with a letter (a-z, but also letters with diacritical marks and non-Latin letters), or an underscore"
+                (c, _) if c.is_alphabetic() => match_kw_id(&mut iter, vec![c.to_ascii_uppercase()]),
+                // Not alphanumeric, and not any of the special chars we listed above: must be a Weasley
+                (c, _) => CockroachToken::UnknownToken(c),
             });
         }
 
         tokens
     }
 
-    // Currently covers:
-    // - Injected semicolons
-    // - Injected comments
-    fn is_malicious_query(pattern: &Vec<Self>) -> bool {
-        let mut iter = pattern.iter();
-        while let Some(token) = iter.next() {
-            match token {
-                CockroachToken::Symbol(';') | CockroachToken::LineComment(_) => return true,
-                CockroachToken::Identifier(_) => {
-                    // Block metadata tables here
-                    // Block file/socket/exec functions here?
+    /// Takes any instances of quoted parameters (such as apostraphe-quoted, like 'param', or dollar-quoted, like $$param$$ or $label$param$label$) and condenses their contents into a single 'Const' token.
+    ///
+    /// This function does not condense quoted parameters contained within block comments or nested quoted parameters, though it does condense quoted parameters that come after a line comment.
+    /// As such, it takes into account all nesting rules related to comments and parameters in PostgreSQL.
+    fn scan_with_parameters(query: &str, direction: ScanDirection) -> Vec<(Self, usize)> {
+        let mut tokens = CockroachToken::scan_without_parameters(query);
+        let mut norm_tokens = Vec::new();
+        let mut layers = Vec::new();
+        let mut next_parameter: Option<String> = None;
+
+        if direction == ScanDirection::Reverse {
+            tokens.reverse()
+        }
+
+        let num_tokens = tokens.len();
+        let mut idx = match direction {
+            ScanDirection::Forward => 0,
+            ScanDirection::Reverse => (num_tokens - 1),
+        };
+
+        for next_token in tokens {
+            idx = match direction {
+                ScanDirection::Forward => idx - 1,
+                ScanDirection::Reverse => idx + 1,
+            };
+
+            match (layers.first(), layers.last()) {
+                (Some(CockroachToken::BlockCommentOpen), _) => {
+                    // BlockCommentOpen can only be on layers stack if direction == Forward
+                    match next_token {
+                        CockroachToken::BlockCommentOpen => layers.push(next_token.clone()),
+                        CockroachToken::BlockCommentClose => {
+                            layers.pop();
+                        }
+                        _ => (),
+                    }
+                    norm_tokens.push((next_token, idx));
                 }
-                CockroachToken::Keyword(Keyword::Or) => {
-                    if is_tautology(iter.clone()) {
-                        return true;
+                (Some(CockroachToken::BlockCommentClose), _) => {
+                    // BlockCommentClose can only be on layers stack if direction == Reverse
+                    match next_token {
+                        CockroachToken::BlockCommentClose => layers.push(next_token.clone()),
+                        CockroachToken::BlockCommentOpen => {
+                            layers.pop();
+                        }
+                        _ => (),
+                    }
+                    norm_tokens.push((next_token, idx));
+                }
+                (_, Some(last)) => {
+                    if next_token.deep_eq(last) {
+                        layers.pop();
+                    } else if let CockroachToken::SingleQuote | CockroachToken::DollarQuote(_) =
+                        next_token
+                    {
+                        layers.push(next_token.clone())
+                    } else if direction == ScanDirection::Forward
+                        && next_token == CockroachToken::BlockCommentOpen
+                    {
+                        layers.push(next_token.clone())
+                    } else if direction == ScanDirection::Reverse
+                        && next_token == CockroachToken::BlockCommentClose
+                    {
+                        layers.push(next_token.clone())
+                    }
+
+                    if !layers.is_empty() {
+                        match next_parameter.as_mut() {
+                            Some(param) => {
+                                write!(param, "{}", next_token).unwrap(); // Will not panic! on unwrap: https://github.com/rust-lang/rust/blob/1.47.0/library/alloc/src/string.rs#L2414-L2427
+                            }
+                            None => next_parameter = Some(next_token.to_string()),
+                        }
+                    } else {
+                        let const_idx = match direction {
+                            ScanDirection::Forward => idx - 1,
+                            ScanDirection::Reverse => idx + 1,
+                        };
+                        norm_tokens.push((
+                            CockroachToken::Const(next_parameter.unwrap_or(String::new())),
+                            const_idx,
+                        ));
+                        norm_tokens.push((next_token, idx));
+                        next_parameter = None;
                     }
                 }
-                // TODO: Add Keyword::And here to checks for (negative) tautology immediately following 'AND'?
-                CockroachToken::Keyword(Keyword::Union) => {}
-                // Maybe someday add logic to see whether a UNION JOIN is malicious
-                _ => (),
+                (_, None) => {
+                    if let CockroachToken::SingleQuote | CockroachToken::DollarQuote(_) = next_token
+                    {
+                        layers.push(next_token.clone());
+                    } else if direction == ScanDirection::Forward
+                        && next_token == CockroachToken::BlockCommentOpen
+                    {
+                        layers.push(next_token.clone())
+                    } else if direction == ScanDirection::Reverse
+                        && next_token == CockroachToken::BlockCommentClose
+                    {
+                        layers.push(next_token.clone())
+                    }
+                    norm_tokens.push((next_token, idx));
+                }
             }
         }
 
-        match pattern.last() {
-            Some(CockroachToken::BlockComment(_)) => true, // Or should we just reject block comments anywhere?
-            _ => false,
+        if let Some(CockroachToken::SingleQuote | CockroachToken::DollarQuote(_)) = layers.first() {
+            let final_idx = match direction {
+                ScanDirection::Forward => num_tokens - 1,
+                ScanDirection::Reverse => 0,
+            };
+            norm_tokens.push((
+                CockroachToken::Const(next_parameter.unwrap_or(String::new())),
+                final_idx,
+            ));
         }
+
+        norm_tokens
     }
 }
 
 // TODO: need to refactor this code...
-fn is_tautology(iter: std::slice::Iter<CockroachToken>) -> bool {
+fn is_tautology<'a, I: std::iter::DoubleEndedIterator<Item = &'a CockroachToken>>(iter: I) -> bool
+where
+    CockroachToken: 'a,
+{
     let mut iter = iter
         .skip_while(|token| -> bool { token.is_whitespace() })
         .peekable(); // Ignore whitespace
@@ -1530,16 +1626,10 @@ fn is_tautology(iter: std::slice::Iter<CockroachToken>) -> bool {
     // Catches some of the trivial cases that are commonly used
     match iter.next() {
         Some(CockroachToken::Keyword(Keyword::True)) => return true,
-        Some(
-            c1 @ (CockroachToken::Sconst(_)
-            | CockroachToken::Fconst(_)
-            | CockroachToken::Iconst(_)
-            | CockroachToken::Bconst(_)
-            | CockroachToken::Bitconst(_)),
-        ) => {
+        Some(c1 @ CockroachToken::Const(_)) => {
             match (iter.next(), iter.next(), iter.next()) {
                 (Some(CockroachToken::Symbol('=')), Some(c2), _) => {
-                    if c1.deep_eq(c2) {
+                    if c1.deep_eq(&c2) {
                         return true;
                     } // Covers `OR 1=1`
                 }
@@ -1553,7 +1643,7 @@ fn is_tautology(iter: std::slice::Iter<CockroachToken>) -> bool {
                     Some(CockroachToken::Symbol('>')),
                     Some(c2),
                 ) => {
-                    if c1 == c2 && !c1.deep_eq(c2) {
+                    if c1 == c2 && !c1.deep_eq(&c2) {
                         return true;
                     } // `OR 1!=2`
                 }
@@ -1639,82 +1729,6 @@ fn is_tautology(iter: std::slice::Iter<CockroachToken>) -> bool {
 // retrieve a vec of Tokens that the prefix/suffix stopped at. IF there is and OR and IF there
 // are no Identifiers after that OR
 
-fn read_until(iter: &mut std::iter::Peekable<std::str::Chars>, c: char) -> String {
-    let mut chars = vec![];
-
-    while let Some(n) = iter.next() {
-        if n == c {
-            return chars.into_iter().collect::<String>();
-        }
-        chars.push(n);
-    }
-
-    chars.into_iter().collect::<String>()
-}
-
-fn match_block_comment(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
-    let mut chars = vec!['/', '*'];
-    let mut nested_depth = 1;
-
-    while let Some(c) = iter.next() {
-        match (c, iter.peek()) {
-            ('/', Some('*')) => {
-                nested_depth += 1; // Another nested '/*'
-                iter.next(); // Consume '*'
-                chars.push('/');
-                chars.push('*');
-            }
-            ('*', Some('/')) => {
-                if nested_depth > 1 {
-                    nested_depth -= 1;
-                    iter.next(); // Consume '/'
-                    chars.push('*');
-                    chars.push('/');
-                } else {
-                    iter.next(); // Consume '/'
-                    return CockroachToken::BlockComment(chars.into_iter().collect::<String>());
-                }
-            }
-            _ => {
-                chars.push(c);
-            }
-        };
-    }
-
-    // Block comment did not have proper closing
-    CockroachToken::BlockComment(chars.into_iter().collect::<String>())
-}
-
-fn match_apostraphe(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
-    let mut chars = vec![];
-
-    while let (Some(c), p) = (iter.next(), iter.peek()) {
-        match (c, p) {
-            ('\'' | '\\', Some('\'')) => {
-                chars.push(c);
-                chars.push('\'');
-                iter.next();
-            }
-            ('\'', _) => {
-                return CockroachToken::Sconst(chars.into_iter().collect::<String>());
-            }
-            _ => {
-                chars.push(c);
-            }
-        };
-    }
-
-    CockroachToken::Sconst(chars.into_iter().collect::<String>())
-}
-
-fn match_bconst(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
-    CockroachToken::Bconst(read_until(iter, '\''))
-}
-
-fn match_bitconst(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
-    CockroachToken::Bitconst(read_until(iter, '\''))
-}
-
 fn match_identifier_quot(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
     let mut chars = vec![];
 
@@ -1735,7 +1749,7 @@ fn match_identifier_quot(iter: &mut std::iter::Peekable<std::str::Chars>) -> Coc
         };
     }
 
-    CockroachToken::Sconst(chars.into_iter().collect::<String>())
+    CockroachToken::Const(chars.into_iter().collect::<String>()) // TODO: should we even be taking out information in between double quotes??
 }
 
 fn match_kw_id(
@@ -1757,19 +1771,15 @@ fn match_kw_id(
     }
 }
 
-fn match_iconst_x(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
-    CockroachToken::Iconst(read_until(iter, '\'')) // iconst x isn't supposed to escape \' or ''
-}
-
 fn match_iconst_0x(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
-    let mut chars = vec![];
+    let mut chars = vec!['0', 'x'];
 
     while let Some(n @ ('0'..='9' | 'a'..='f' | 'A'..='F')) = iter.peek() {
         chars.push(n.clone());
         iter.next();
     }
 
-    CockroachToken::Iconst(chars.into_iter().collect::<String>())
+    CockroachToken::Const(chars.into_iter().collect::<String>())
 }
 
 fn match_fconst_period(
@@ -1799,7 +1809,7 @@ fn match_fconst_period(
         };
     }
 
-    CockroachToken::Fconst(chars.into_iter().collect::<String>())
+    CockroachToken::Const(chars.into_iter().collect::<String>())
 }
 
 fn match_fconst_e(
@@ -1811,7 +1821,7 @@ fn match_fconst_e(
         iter.next();
     }
 
-    CockroachToken::Fconst(chars.into_iter().collect::<String>())
+    CockroachToken::Const(chars.into_iter().collect::<String>())
 }
 
 fn match_placeholder(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
@@ -1835,39 +1845,11 @@ fn match_dollar_opening(iter: &mut std::iter::Peekable<std::str::Chars>) -> Cock
     match iter.peek() {
         Some('$') => {
             iter.next();
-            match_dollar_sconst(iter, ident.into_iter().collect::<String>())
+            /* match_dollar_sconst(iter, ident.into_iter().collect::<String>()) */
+            CockroachToken::DollarQuote(ident.into_iter().collect::<String>())
         }
-        _ => CockroachToken::Placeholder(ident.into_iter().collect::<String>()), // TODO: this can be an invalid placeholder
+        _ => CockroachToken::Placeholder(ident.into_iter().collect::<String>()), // TODO: this IS an invalid placeholder
     }
-}
-
-fn match_dollar_sconst(
-    iter: &mut std::iter::Peekable<std::str::Chars>,
-    mut identifier: String,
-) -> CockroachToken {
-    let mut chars: Vec<char> = vec![];
-    let mut id_index = None;
-
-    identifier.push('$');
-
-    while let Some(p @ ('a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '$')) = iter.peek() {
-        match id_index {
-            Some(i) => match chars.get(i) {
-                Some(c) => id_index = if p == c { Some(i + 1) } else { None },
-                None => {
-                    return CockroachToken::Sconst(
-                        chars[..chars.len() - i].iter().collect::<String>(),
-                    )
-                }
-            },
-            None => id_index = if *p == '$' { Some(0) } else { None },
-        };
-
-        chars.push(p.clone());
-        iter.next();
-    }
-
-    CockroachToken::Sconst(chars.into_iter().collect::<String>())
 }
 
 fn match_const_digit(
@@ -1884,6 +1866,6 @@ fn match_const_digit(
             chars.push('.');
             match_fconst_period(iter, chars)
         }
-        Some(_) | None => CockroachToken::Iconst(chars.into_iter().collect::<String>()),
+        Some(_) | None => CockroachToken::Const(chars.into_iter().collect::<String>()),
     };
 }

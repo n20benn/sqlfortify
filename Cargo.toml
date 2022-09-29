@@ -13,3 +13,4 @@ socket2 = { version = "0.4", features = ["all"] }
 log = "0.4"
 env_logger = "0.9"
 libc = "0.2"
+enum-display-derive = "0.1"

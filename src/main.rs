@@ -3,6 +3,8 @@
 // #![allow(dead_code)]
 // #![forbid(unsafe_code)]
 
+//#![feature(generic_associated_types)]
+
 mod key_pool;
 mod matcher;
 mod postgres_packet;
@@ -21,16 +23,18 @@ mod wire_reader;
 
 use log::{error, info, trace};
 use socket2::{SockAddr, Socket};
-use std::io;
 use std::net::SocketAddr;
 use std::{panic, process, thread};
 
 use cockroach_token::CockroachToken;
 use event_handler::EventHandler;
-use token::SqlToken;
+use token::{CheckParameters, SqlToken};
 
 use postgres_session::PostgresProxySession;
 use sql_session::ProxySession;
+
+#[macro_use]
+extern crate enum_display_derive;
 
 fn main() {
     env_logger::init(); // Logging to stderr by default
@@ -96,18 +100,25 @@ fn main() {
     let listen = SockAddr::from(listen);
     let db = SockAddr::from(db);
 
+    // This will get populated by the config file
+    let params = CheckParameters {};
+
     // Both 'parse' and 'from' support IPv4 and IPv6, but not Unix domain sockets. Do this:
     // #[cfg(target_family="unix")]
     // SockAddr::unix(String::from("Path"));
 
-    create_thread::<CockroachToken, PostgresProxySession<Socket, Socket>>(listen, db);
+    create_thread::<CockroachToken, PostgresProxySession<Socket, Socket>>(listen, db, params);
 
     loop {
         thread::park(); // Not guaranteed to block forever, so we loop
     }
 }
 
-fn create_thread<T, P>(listen_address: SockAddr, db_address: SockAddr)
+fn create_thread<T, P>(
+    listen_address: SockAddr,
+    db_address: SockAddr,
+    check_params: CheckParameters,
+)
 // NOTE: could add C, S generics here that impl io::read and io::write to extend functionality beyond inet sockets
 where
     T: SqlToken,
@@ -118,7 +129,7 @@ where
         .spawn(move || {
             let mut handler: EventHandler<T, P>;
 
-            match EventHandler::new(listen_address, db_address) {
+            match EventHandler::new(listen_address, db_address, check_params) {
                 Ok(h) => handler = h,
                 Err(e) => {
                     error!(
