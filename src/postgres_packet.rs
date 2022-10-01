@@ -191,6 +191,10 @@ pub fn read_standard_packet_len(buffer: &[u8]) -> Result<(u8, usize), &'static s
 
 pub fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'static str> {
     let packet_length = read_startup_packet_len(buffer)?;
+    if buffer.len() != packet_length {
+        return Err("startup packet length field mismatch (internal error)")
+    }
+
     let mut reader = WireReader::new(buffer);
     reader.advance_up_to(4);
 
@@ -228,6 +232,10 @@ pub fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &
 
 pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'static str> {
     let (packet_identifier, packet_length) = read_standard_packet_len(buffer)?;
+    if buffer.len() - 1 != packet_length {
+        return Err("request packet length field mismatch (internal error)")
+    }
+
     let mut reader = WireReader::new(buffer);
     reader.advance_up_to(5);
 
@@ -237,7 +245,7 @@ pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, 
     }
 
     match packet_identifier {
-        b'B' => parse_bind_packet(packet_length, reader),
+        b'B' => parse_bind_packet(reader),
         b'C' => match reader.read_byte()? {
             b'S' => Ok(RequestPacket::ClosePrepared(
                 reader.read_utf8_c_str_and_finalize()?,
@@ -266,7 +274,7 @@ pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, 
             reader.read_int32_and_finalize()?,
         )),
         b'H' => Ok(RequestPacket::Flush),
-        b'F' => parse_function_req_packet(packet_length, reader),
+        b'F' => parse_function_req_packet(reader),
         b'p' => Ok(RequestPacket::AuthDataResponse(
             reader.read_remaining_bytes(),
         )),
@@ -289,6 +297,9 @@ pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, 
 
 pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket, &'static str> {
     let (packet_identifier, packet_length) = read_standard_packet_len(buffer)?;
+    if buffer.len() - 1 != packet_length {
+        return Err("response packet length field mismatch (internal error)")
+    }
     let mut reader = WireReader::new(buffer);
     reader.advance_up_to(5);
 
@@ -302,7 +313,7 @@ pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket
             reader.read_int32()?,
             reader.read_int32_and_finalize()?,
         )),
-        b'R' => parse_auth_resp_packet(packet_length, reader),
+        b'R' => parse_auth_resp_packet(reader),
         b'2' => Ok(ResponsePacket::BindComplete),
         b'3' => Ok(ResponsePacket::CloseComplete),
         b'C' => Ok(ResponsePacket::CommandComplete(
@@ -310,10 +321,10 @@ pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket
         )),
         b'd' => Ok(ResponsePacket::CopyData(reader.read_remaining_bytes())),
         b'c' => Ok(ResponsePacket::CopyDone),
-        b'G' => parse_copyin_response_packet(packet_length, reader),
-        b'H' => parse_copyout_response_packet(packet_length, reader),
-        b'W' => parse_copyboth_response_packet(packet_length, reader),
-        b'D' => parse_datarow_response_packet(packet_length, reader),
+        b'G' => parse_copyin_response_packet(reader),
+        b'H' => parse_copyout_response_packet(reader),
+        b'W' => parse_copyboth_response_packet(reader),
+        b'D' => parse_datarow_response_packet(reader),
         b'I' => Ok(ResponsePacket::EmptyQueryResponse),
         b'E' => Ok(ResponsePacket::ErrorResponse(
             reader.read_term_utf8_byte_string_map_and_finalize()?,
@@ -359,13 +370,12 @@ pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket
             b'E' => TransactionStatus::FailedTransaction,
             _ => return Err("packet contained unrecognized transaction status indicator"),
         })),
-        b'T' => parse_rowdescription_resp_packet(packet_length, reader),
+        b'T' => parse_rowdescription_resp_packet(reader),
         _ => Err("packet contained unrecognized packet identifier"),
     }
 }
 
 fn parse_rowdescription_resp_packet<'a>(
-    packet_length: usize,
     mut reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
     let field_cnt = reader.read_int16_length()?;
@@ -397,7 +407,6 @@ fn parse_rowdescription_resp_packet<'a>(
 }
 
 fn parse_function_req_packet<'a>(
-    packet_length: usize,
     mut reader: WireReader<'a>,
 ) -> Result<RequestPacket, &'static str> {
     let object_id = reader.read_int32()?;
@@ -435,7 +444,6 @@ fn parse_function_req_packet<'a>(
 }
 
 fn parse_datarow_response_packet<'a>(
-    packet_length: usize,
     mut reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
     let column_cnt = reader.read_int16_length()?;
@@ -452,31 +460,27 @@ fn parse_datarow_response_packet<'a>(
 }
 
 fn parse_copyin_response_packet<'a>(
-    packet_length: usize,
     reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
-    let (is_binary, format_codes) = parse_copy_response_fields(packet_length, reader)?;
+    let (is_binary, format_codes) = parse_copy_response_fields(reader)?;
     Ok(ResponsePacket::CopyInResponse(is_binary, format_codes))
 }
 
 fn parse_copyout_response_packet<'a>(
-    packet_length: usize,
     reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
-    let (is_binary, format_codes) = parse_copy_response_fields(packet_length, reader)?;
+    let (is_binary, format_codes) = parse_copy_response_fields(reader)?;
     Ok(ResponsePacket::CopyOutResponse(is_binary, format_codes))
 }
 
 fn parse_copyboth_response_packet<'a>(
-    packet_length: usize,
     reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
-    let (is_binary, format_codes) = parse_copy_response_fields(packet_length, reader)?;
+    let (is_binary, format_codes) = parse_copy_response_fields(reader)?;
     Ok(ResponsePacket::CopyBothResponse(is_binary, format_codes))
 }
 
 fn parse_copy_response_fields<'a>(
-    packet_length: usize,
     mut reader: WireReader<'a>,
 ) -> Result<(bool, Vec<bool>), &'static str> {
     let is_binary = match reader.read_byte()? {
@@ -499,7 +503,6 @@ fn parse_copy_response_fields<'a>(
 }
 
 fn parse_auth_resp_packet<'a>(
-    packet_length: usize,
     mut reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
     let auth_mechanism = reader.read_int32()?;
@@ -535,7 +538,6 @@ fn parse_auth_resp_packet<'a>(
 }
 
 fn parse_bind_packet<'a>(
-    packet_length: usize,
     mut reader: WireReader<'a>,
 ) -> Result<RequestPacket, &'static str> {
     let dest_portal = reader.read_utf8_c_str()?;

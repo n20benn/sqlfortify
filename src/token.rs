@@ -1,8 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
-pub struct CheckParameters {}
-
 // Note: this trait is meant to work especially well with Enums
 pub trait SqlToken: Eq + Hash + Clone + Debug + Display {
     // Trait Eq should evaluate true if two tokens are the same type.
@@ -40,17 +38,9 @@ pub trait SqlToken: Eq + Hash + Clone + Debug + Display {
     // is specific to a given token within the token's file (or else
     // referenced directly by the token's file).
     fn scan_forward(query: &str) -> Vec<(Self, usize)>;
+    // TODO: you NEED to consolidate anything found in comments into a single token.
+    // The reason for this is that comments could appear to be malicious SQL when they are in fact benign.
+    // After all, an attacker would have no reason or benefit to inserting SQL comments containing malicious commands...
 
     fn scan_reverse(query: &str) -> Vec<(Self, usize)>;
-
-    // Could do the same for parsing, but should probably put in
-    // its own module (since it won't use these tokens)
-    //  fn parse(query:&str) -> Result<>;
-
-    fn is_malicious_query<'a, I: std::iter::DoubleEndedIterator<Item = &'a Self> + Clone>(
-        query_iter: I,
-        checks: &CheckParameters,
-    ) -> bool
-    where
-        Self: 'a;
 }

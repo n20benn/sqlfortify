@@ -1,5 +1,7 @@
-use super::token::SqlToken;
-use hashbrown::{hash_map::Entry, HashMap}; // Switch to std HashMap once get_key_value_mut and try_insert are implemented
+use crate::token::SqlToken;
+
+use super::sqli_detector;
+use std::collections::{HashMap, hash_map::Entry};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeID {
@@ -53,10 +55,6 @@ impl<T: SqlToken> Node<T> {
         self.next.get_mut(token)
     }
 
-    fn get_key_value_mut(&mut self, token: &T) -> Option<(&T, &mut Node<T>)> {
-        self.next.get_key_value_mut(token)
-    }
-
     fn get_child_update(&mut self, token: T, id_counter: &mut IDCounter) -> &mut Node<T> {
         // This code took a lot of digging to get right, so I'm going to leave some info here.
         // Rust has this thing where you can't borrow mutable references twice in one
@@ -108,14 +106,14 @@ impl<'a, T: SqlToken> NodeInfo<'a, T> {
     }
 }
 
-pub struct SqlMatcher<T: SqlToken> {
-    fwd_root: Node<T>, // Empty node to make traversal more easy
-    rev_root: Node<T>, // ditto
+pub struct SqlMatcher<D: sqli_detector::Detector> {
+    fwd_root: Node<D::Token>, // Empty node to make traversal more easy
+    rev_root: Node<D::Token>, // ditto
     id_counter: IDCounter,
     // Settings for check strictness can be stored in here (and passed in on new())
 }
 
-impl<T: SqlToken> SqlMatcher<T> {
+impl<D: sqli_detector::Detector> SqlMatcher<D> {
     pub fn new() -> Self {
         let mut counter = IDCounter::new();
         Self {
@@ -125,8 +123,11 @@ impl<T: SqlToken> SqlMatcher<T> {
         }
     }
 
-    pub fn match_prefix<'a>(&'a self, forward_tokens: &Vec<(T, usize)>) -> Option<NodeInfo<'a, T>> {
-        let mut last_param_parent_node: Option<&Node<T>> = None;
+    pub fn match_prefix<'a>(
+        &'a self,
+        forward_tokens: &Vec<(D::Token, usize)>,
+    ) -> Option<NodeInfo<'a, D::Token>> {
+        let mut last_param_parent_node: Option<&Node<D::Token>> = None;
         let mut node = &self.fwd_root;
         let mut prefix_index = 0;
         let mut absolute_index = 0;
@@ -174,9 +175,9 @@ impl<T: SqlToken> SqlMatcher<T> {
 
     pub fn match_suffix<'a>(
         &'a self,
-        reverse_tokens: &Vec<(T, usize)>,
-        prefix: &'a NodeInfo<T>,
-    ) -> Option<NodeInfo<'a, T>> {
+        reverse_tokens: &Vec<(D::Token, usize)>,
+        prefix: &'a NodeInfo<D::Token>,
+    ) -> Option<NodeInfo<'a, D::Token>> {
         let fwd_param_id = match prefix.node.next_param_id {
             Some(id) => id,
             None => return None, // NOTE: this should never be the case, as `match_prefix()` only returns nodes with a `next_param_id`
@@ -209,7 +210,11 @@ impl<T: SqlToken> SqlMatcher<T> {
         suffix
     }
 
-    pub fn mark_vuln(&mut self, sql_query: &Vec<(T, usize)>, vuln_prefix_id: Option<NodeID>) {
+    pub fn mark_vuln(
+        &mut self,
+        sql_query: &Vec<(D::Token, usize)>,
+        vuln_prefix_id: Option<NodeID>,
+    ) {
         let mut node = &mut self.fwd_root;
         match vuln_prefix_id {
             Some(vuln_id) => {
@@ -250,40 +255,38 @@ impl<T: SqlToken> SqlMatcher<T> {
 
     // If pattern already exists, just updates is_constant values.
     // Could also name insert()
-    pub fn update_pattern(&mut self, sql_query: Vec<(T, usize)>) {
+    pub fn update_pattern(&mut self, sql_query: Vec<(D::Token, usize)>) {
         let token_id_pairs = self.update_fwd_tree(sql_query);
         self.update_rev_tree(token_id_pairs);
     }
 
     // Consumes the vector of tokens and produces a vector of
     // tuples with those tokens (and NodeIDs) to use
-    fn update_fwd_tree(&mut self, sql_query: Vec<(T, usize)>) -> Vec<(T, NodeID)> {
+    fn update_fwd_tree(&mut self, sql_query: Vec<(D::Token, usize)>) -> Vec<(D::Token, NodeID)> {
         let mut node = &mut self.fwd_root;
         let mut fwd_nodes = vec![];
 
         // Consume each token and traverse tree, adding/updating nodes as needed
         for (token, _) in sql_query.into_iter() {
-            match node.next.get_key_value_mut(&token) {
-                Some((existing_token, next_node)) => {
-                    // We already know token == existing token; just check deep_eq
-
-                    if token.is_param_token() && !token.deep_eq(existing_token) {
-                        next_node.is_constant = false;
-                        node.next_param_id = Some(next_node.id);
-                        // node.next_param_id.insert(next_node.id);
-                    }
-                }
-                None => (),
+            let make_nonconst = match node.next.get_key_value(&token) {
+                Some((existing_token, _)) => token.is_param_token() && !token.deep_eq(existing_token),
+                None => false,
             };
 
-            // NOTE: Do this instead if you want to get rid of constant logic and assume all
-            // integer/string types in SQL could be user input:
-            //  if token.is_param_token() {
-            //      node.next_param_ids.insert(next_node.id.clone());
-            //  }
+            node = match node.next.entry(token.clone()) {
+                Entry::Occupied(o) => {
+                    let next_node = o.into_mut();
+                    if make_nonconst {
+                        next_node.is_constant = false;
+                        node.next_param_id = Some(next_node.id);
+                    }
+                    next_node
+                },
+                Entry::Vacant(v) => {
+                    v.insert(Node::new(self.id_counter.next()))
+                },
+            };
 
-            // Go to next node, creating it if it doesn't exist
-            node = node.get_child_update(token.clone(), &mut self.id_counter);
             fwd_nodes.push((token, node.id.clone()));
         }
 
@@ -291,24 +294,27 @@ impl<T: SqlToken> SqlMatcher<T> {
         fwd_nodes
     }
 
-    fn update_rev_tree(&mut self, fwd_nodes: Vec<(T, NodeID)>) {
+    fn update_rev_tree(&mut self, rev_nodes: Vec<(D::Token, NodeID)>) {
         let mut node = &mut self.rev_root;
 
         // Consume each token and traverse tree, adding/updating nodes as needed
-        for (token, node_id) in fwd_nodes.into_iter().rev() {
-            match node.get_key_value_mut(&token) {
-                Some((existing_token, next_node)) => {
-                    if token.is_param_token() && !token.deep_eq(existing_token) {
-                        next_node.is_constant = false;
-                        node.next_param_id = Some(node_id);
-                        // node.next_param_id.insert(node_id);
-                    }
-                }
-                None => (),
+        for (token, _) in rev_nodes {
+            let make_nonconst = match node.next.get_key_value(&token) {
+                Some((k, _)) => token.is_param_token() && !token.deep_eq(k),
+                None => false,
             };
 
-            // Go to next node, creating it if it doesn't exist
-            node = node.get_child_update(token, &mut self.id_counter);
+            node = match node.next.entry(token) {
+                Entry::Occupied(o) => {
+                    let next_node = o.into_mut();
+                    if make_nonconst {
+                        next_node.is_constant = false;
+                        node.next_param_id = Some(next_node.id);
+                    }
+                    next_node
+                },
+                Entry::Vacant(v) => v.insert(Node::new(self.id_counter.next())),
+            };
         }
 
         node.is_valid_pattern = true; // Not sure we need this...

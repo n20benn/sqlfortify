@@ -1,37 +1,30 @@
-//#[feature(nll)] // Enforced breakage with non-lexical lifetimes (going to be a thing soon in Rust)
-// #![allow(unused)] // TODO: remove once ready to refine code
-// #![allow(dead_code)]
-// #![forbid(unsafe_code)]
-
-//#![feature(generic_associated_types)]
-
+mod event_handler;
 mod key_pool;
 mod matcher;
-mod postgres_packet;
-mod postgres_session;
 mod proxy;
-mod sql_session;
-mod token;
 mod validator;
-//mod iso_token;
-//mod postgres_token;
-mod base_session;
-mod cockroach_token;
-mod event_handler;
-mod mysql_session;
 mod wire_reader;
 
-use log::{error, info, trace};
+// Code specific to scanning in packets from the wire
+mod postgres_packet;
+
+// Code specific to sending requests/responses
+mod sql_session;
+mod mysql_session;
+mod postgres_session;
+
+mod token;
+mod cockroach_token;
+
+mod sqli_detector;
+mod cockroach_detector;
+
+
+use cockroach_detector::CockroachDetector;
 use socket2::{SockAddr, Socket};
 use std::net::SocketAddr;
-use std::{panic, process, thread};
-
-use cockroach_token::CockroachToken;
-use event_handler::EventHandler;
-use token::{CheckParameters, SqlToken};
 
 use postgres_session::PostgresProxySession;
-use sql_session::ProxySession;
 
 #[macro_use]
 extern crate enum_display_derive;
@@ -39,6 +32,7 @@ extern crate enum_display_derive;
 fn main() {
     env_logger::init(); // Logging to stderr by default
 
+    /*
     // TODO: Someday we'll have per-thread handling of crashes... but not today.
     // If any thread panics, we kill the entire process so that the system's
     // service handler (systemd or sc, for instance) can handle the shutdown
@@ -74,6 +68,7 @@ fn main() {
         error!("Forcing process termination with exit code 1");
         process::exit(1); // Important part--kills all threads if any one dies
     }));
+    */
 
     /*
 
@@ -95,44 +90,68 @@ fn main() {
     // TODO: parse configuration here
 
     let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap(); // TODO: remove unwrap
-    let db: SocketAddr = "127.0.0.1:8081".parse().unwrap(); // TODO: remove unwrap
+    let db: SocketAddr = "127.0.0.1:5432".parse().unwrap(); // TODO: remove unwrap
 
     let listen = SockAddr::from(listen);
     let db = SockAddr::from(db);
 
     // This will get populated by the config file
-    let params = CheckParameters {};
+    let params = event_handler::Parameters::default();
 
     // Both 'parse' and 'from' support IPv4 and IPv6, but not Unix domain sockets. Do this:
     // #[cfg(target_family="unix")]
     // SockAddr::unix(String::from("Path"));
 
-    create_thread::<CockroachToken, PostgresProxySession<Socket, Socket>>(listen, db, params);
+    /*
+    create_thread::<CockroachDetector, PostgresProxySession<Socket, Socket>>(listen, db, params);
 
     loop {
         thread::park(); // Not guaranteed to block forever, so we loop
     }
+    */
+
+    let mut handler: event_handler::EventHandler<
+        CockroachDetector,
+        PostgresProxySession<Socket, Socket>,
+    >;
+
+    match event_handler::EventHandler::new(listen, db, params) {
+        Ok(h) => handler = h,
+        Err(e) => {
+            log::error!(
+                "Unrecoverable error occurred while initializing event handler ({})",
+                e
+            );
+            return;
+        }
+    };
+
+    match handler.handle_loop() {
+        Ok(()) => log::error!("An unknown error occurred that caused the event loop to return"), // Invariant: should never happen (event loop is infinite loop)
+        Err(e) => log::error!("Unrecoverable error caused event loop to crash ({})", e),
+    }
 }
 
-fn create_thread<T, P>(
+/*
+fn create_thread<D, P>(
     listen_address: SockAddr,
     db_address: SockAddr,
-    check_params: CheckParameters,
+    params: event_handler::Parameters,
 )
 // NOTE: could add C, S generics here that impl io::read and io::write to extend functionality beyond inet sockets
 where
-    T: SqlToken,
+    D: sqli_detector::Detector,
     P: ProxySession<Socket, Socket>,
 {
-    let _ = thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("CockroachDB".to_string())
         .spawn(move || {
-            let mut handler: EventHandler<T, P>;
+            let mut handler: event_handler::EventHandler<D, P>;
 
-            match EventHandler::new(listen_address, db_address, check_params) {
+            match event_handler::EventHandler::new(listen_address, db_address, params) {
                 Ok(h) => handler = h,
                 Err(e) => {
-                    error!(
+                    log::error!(
                         "Unrecoverable error occurred while initializing event handler: {}",
                         e
                     );
@@ -141,8 +160,9 @@ where
             };
 
             match handler.handle_loop() {
-                Ok(()) => error!("An unknown error occurred that caused the event loop to return"), // Invariant: should never happen (event loop is infinite loop)
-                Err(e) => error!("Unrecoverable error caused event loop to crash: {}", e),
+                Ok(()) => log::error!("An unknown error occurred that caused the event loop to return"), // Invariant: should never happen (event loop is infinite loop)
+                Err(e) => log::error!("Unrecoverable error caused event loop to crash: {}", e),
             }
         });
 }
+*/

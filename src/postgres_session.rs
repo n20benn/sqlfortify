@@ -10,7 +10,15 @@ const STARTUP_PKT_HDRLEN: usize = 4;
 const STANDARD_PKT_HDRLEN: usize = 5;
 const SSL_RESPONSE_PKT_HDRLEN: usize = 1;
 
-const DEFAULT_REQ_RESP_BUFLEN: usize = 1 * 1024 * 1024; // 1MB
+const DEFAULT_REQ_RESP_BUFLEN: usize = 1 * 1024; // 1KB
+
+// ErrorResponse packet is 58 bytes long: \x00\x00\x00\x3A
+const ERROR_PACKET_BYTES: &'static [u8] = b"E\x00\x00\x00\x3ASERROR\x00C42000\x00MMalformed input blocked by SQLFortify\x00\x00Z\x00\x00\x00\x05I";
+// TODO: this always assumes not in a transaction block. Will that cause issues???
+// I => idle (not in Transaction block)
+// T => in transaction block
+// E => in failed transaction block
+// Realistically, we'd only ever be in 'I' or 'E'. It seems like always returning 'I' would be preferable to always returning 'E'?
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionState {
@@ -37,7 +45,7 @@ impl PostgresRequest {
             basic_info: MessageInfo::new(),
             is_valid: false,
             packet_start: 0,
-            raw_data: Vec::from_iter(std::iter::repeat(0).take(DEFAULT_REQ_RESP_BUFLEN)), // TODO: is this inefficient? is there a better way?
+            raw_data: Vec::from([0; DEFAULT_REQ_RESP_BUFLEN]),
             raw_len: 0,
         }
     }
@@ -124,6 +132,7 @@ impl<T: io::Read + io::Write> ClientSession<T> for PostgresClientSession<T> {
 
     fn receive_response(&mut self) -> io::Result<Self::ResponseType> {
         let mut response = match self.recycled_responses.pop_front() {
+            // TODO: handle case where buffers grow too big
             Some(req) => req,
             None => PostgresResponse::new(),
         };
@@ -244,13 +253,24 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
             None => PostgresRequest::new(),
         };
 
+        log::debug!("Receiving request...");
         match receive_request(&mut self.server_io, &mut request, &mut self.state) {
-            Ok(()) => Ok(request),
+            Ok(()) => {
+                log::debug!("Request received");
+                Ok(request)
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                log::debug!("Request needs more bytes to be received");
                 self.recycled_requests.push_front(request);
                 Err(e)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                log::debug!(
+                    "Receiving request failed with other error: {}",
+                    e.to_string()
+                );
+                Err(e)
+            }
         }
     }
 
@@ -269,18 +289,30 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
             None => PostgresResponse::new(),
         };
 
+        log::debug!("Receiving response...");
+
         match receive_response(
             &mut self.client_io,
             &mut response,
             &mut self.state,
             &mut self.request_failure,
         ) {
-            Ok(()) => Ok(response),
+            Ok(()) => {
+                log::debug!("Response received");
+                Ok(response)
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                log::debug!("Response needs more bytes to be received");
                 self.recycled_responses.push_front(response);
                 Err(e)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                log::debug!(
+                    "Receiving response failed with other error: {}",
+                    e.to_string()
+                );
+                Err(e)
+            }
         }
     }
 
@@ -294,12 +326,20 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
     }
 
     /// Safely reuses the allocated structures and buffers of the given request, thereby resulting in fewer repeated allocations of large buffers
-    fn recycle_request(&mut self, request: Self::RequestType) {
+    fn recycle_request(&mut self, mut request: Self::RequestType) {
+        request.basic_info = MessageInfo::new();
+        request.packet_start = 0;
+        request.raw_len = 0;
+        request.is_valid = false;
         self.recycled_requests.push_back(request);
     }
 
     /// Safely reuses the allocated structures and buffers of the given response, thereby resulting in fewer repeated allocations of large buffers
-    fn recycle_response(&mut self, response: Self::ResponseType) {
+    fn recycle_response(&mut self, mut response: Self::ResponseType) {
+        response.basic_info = MessageInfo::new();
+        response.packet_start = 0;
+        response.raw_len = 0;
+        response.is_valid = false;
         self.recycled_responses.push_back(response);
     }
 
@@ -333,9 +373,9 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
 
     fn backend_downgrade_ssl(
         &mut self,
-        ssl_response: &mut Self::ResponseType,
+        _ssl_response: &mut Self::ResponseType,
     ) -> Option<Self::RequestType> {
-        None // TODO: stub
+        todo!() // TODO: stub
     }
 
     fn frontend_downgrade_gssenc(
@@ -360,9 +400,9 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
 
     fn backend_downgrade_protocol(
         &mut self,
-        proto_request: &mut Self::ResponseType,
+        _proto_request: &mut Self::ResponseType,
     ) -> Option<Self::RequestType> {
-        None // TODO: stub
+        todo!() // TODO: stub
     }
 
     fn error_response(&mut self) -> Self::ResponseType {
@@ -373,8 +413,8 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
             basic_info: basic_info,
             is_valid: true,
             packet_start: 0,
-            raw_data: Vec::new(), // TODO: stub; add error bytes here
-            raw_len: 0,           // TODO: stub. length of raw_data here
+            raw_data: Vec::from_iter(ERROR_PACKET_BYTES.iter().map(|b| *b)), // TODO: stub; add error bytes here
+            raw_len: ERROR_PACKET_BYTES.len(),
         }
     }
 }
@@ -389,31 +429,44 @@ fn move_up_to<'a>(buf: &'a mut [u8], amount: usize) -> &'a mut [u8] {
 fn read_packet<'a, T: io::Read>(
     io: &mut T,
     buf: &'a mut Vec<u8>,
-    raw_len: usize,
+    raw_len: &mut usize,
     pkt_start_idx: usize,
     pkt_len: usize,
 ) -> io::Result<&'a mut [u8]> {
     // avoid usize overflow here
-    if usize::MAX - pkt_len > pkt_start_idx {
+    if usize::MAX - pkt_len < pkt_start_idx {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "packet received exceeded max packet processing size",
         ));
     }
 
-    if pkt_start_idx + pkt_len > buf.len() {
-        let extension_len = cmp::max(buf.len(), pkt_start_idx + pkt_len); // We need more buffer--at least double the current one
-        buf.extend(std::iter::repeat(0).take(extension_len));
-    }
+    // TODO: if initially_read > pkt_len, then...?
 
-    let packet_buffer = &mut buf[pkt_start_idx..pkt_start_idx + pkt_len];
+    let mut buffer_length = buf.len();
 
-    let initially_read = cmp::max(raw_len - pkt_start_idx, 0);
-    let mut remaining_buffer = move_up_to(packet_buffer, initially_read);
+    let initially_read = cmp::max(*raw_len - pkt_start_idx, 0);
+    let mut remaining_buffer = &mut buf[cmp::min(pkt_start_idx + initially_read, buffer_length)
+        ..cmp::min(pkt_start_idx + pkt_len, buffer_length)];
 
     loop {
         if remaining_buffer.len() == 0 {
-            return Ok(packet_buffer);
+            log::debug!("Read entirity of buffer");
+            if pkt_start_idx + pkt_len > buffer_length {
+                log::debug!("Packet contents exceeded available space--increasing buffer size");
+
+                let curr_idx = buffer_length;
+                let extension_len = cmp::min(buffer_length, pkt_len - pkt_start_idx); // We need more buffer--at most double the current one
+                buf.extend(std::iter::repeat(0).take(extension_len));
+                buffer_length = buf.len();
+
+                remaining_buffer =
+                    &mut buf[curr_idx..cmp::min(pkt_start_idx + pkt_len, buffer_length)];
+            } else {
+                let packet_buffer =
+                    &mut buf[pkt_start_idx..cmp::min(pkt_start_idx + pkt_len, buffer_length)];
+                return Ok(packet_buffer);
+            }
         }
 
         match io.read(remaining_buffer) {
@@ -423,7 +476,11 @@ fn read_packet<'a, T: io::Read>(
                     "I/O device unexpectedly had no more data",
                 ))
             }
-            Ok(len) => remaining_buffer = move_up_to(remaining_buffer, len),
+            Ok(len) => {
+                *raw_len += len;
+                log::debug!("Read {} bytes into buffer", len);
+                remaining_buffer = move_up_to(remaining_buffer, len)
+            }
             Err(e) => return Err(e),
         }
     }
@@ -438,26 +495,32 @@ fn receive_request<T: io::Read>(
 
     match state {
         SessionState::Startup => {
+            log::debug!("Reading startup request header...");
             let header_bytes = read_packet(
                 io,
                 &mut request.raw_data,
-                request.raw_len,
+                &mut request.raw_len,
                 request.packet_start,
                 STARTUP_PKT_HDRLEN,
             )?;
+            log::debug!("Request header read.");
             let pkt_len = match read_startup_packet_len(header_bytes) {
                 Ok(l) => l,
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
             };
 
+            log::debug!("Reading startup request body...");
             let pkt = read_packet(
                 io,
                 &mut request.raw_data,
-                request.raw_len,
+                &mut request.raw_len,
                 request.packet_start,
                 pkt_len,
             )?;
+
+            log::debug!("Request body read.");
             request.packet_start += pkt_len;
+            request.is_valid = true;
 
             match parse_startup_req_packet(pkt) {
                 Ok(RequestPacket::SSLRequest) => {
@@ -473,6 +536,7 @@ fn receive_request<T: io::Read>(
                     request.basic_info.username = Some(user.to_string());
                     request.basic_info.database =
                         Some(params.get("database").unwrap_or(&user).to_string());
+                    request.basic_info.is_request = true;
                     if version != PostgresWireVersion::V3_0 {
                         request.basic_info.unsupported_version = true;
                     }
@@ -488,26 +552,32 @@ fn receive_request<T: io::Read>(
             }
         }
         _ => {
+            log::debug!("Reading request header...");
             let header_bytes = read_packet(
                 io,
                 &mut request.raw_data,
-                request.raw_len,
+                &mut request.raw_len,
                 request.packet_start,
                 STANDARD_PKT_HDRLEN,
             )?;
+            log::debug!("Request header read.");
+
             let pkt_len = match read_standard_packet_len(header_bytes) {
-                Ok((c, l)) => l,
+                Ok((_, l)) => l,
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
             };
 
+            log::debug!("Reading request body...");
             let pkt = read_packet(
                 io,
                 &mut request.raw_data,
-                request.raw_len,
+                &mut request.raw_len,
                 request.packet_start,
                 pkt_len,
             )?;
             request.packet_start += pkt_len;
+            request.is_valid = true;
+            log::debug!("Request body read.");
 
             match (*state, parse_standard_req_packet(pkt)) {
                 (SessionState::Normal, Ok(RequestPacket::Query(q))) => {
@@ -546,27 +616,33 @@ fn receive_response<T: io::Read>(
     state: &mut SessionState,
     request_failure: &mut Option<bool>,
 ) -> io::Result<()> {
+    log::debug!("Reading response header...");
     let header_bytes = read_packet(
         io,
         &mut response.raw_data,
-        response.raw_len,
+        &mut response.raw_len,
         response.packet_start,
         STANDARD_PKT_HDRLEN,
     )?;
+    log::debug!("Response header read.");
+
     let pkt_len = match read_standard_packet_len(header_bytes) {
-        Ok((c, l)) => l,
+        Ok((_, l)) => l,
         Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
     };
 
+    log::debug!("Reading response body...");
     let pkt = read_packet(
         io,
         &mut response.raw_data,
-        response.raw_len,
+        &mut response.raw_len,
         response.packet_start,
         pkt_len,
     )?;
     response.packet_start += pkt_len;
     response.is_valid = true;
+
+    log::debug!("Response body read.");
 
     match (*state, parse_standard_resp_packet(pkt)) {
         (_, Ok(ResponsePacket::ErrorResponse(_))) => *request_failure = Some(true),
@@ -599,12 +675,18 @@ fn receive_response<T: io::Read>(
 fn send_request<T: io::Write>(
     io: &mut T,
     request: &PostgresRequest,
-    state: &mut SessionState,
+    _state: &mut SessionState,
     start: &mut Option<usize>,
 ) -> io::Result<()> {
     let mut total_written = start.unwrap_or(0);
 
-    let buf = match request.as_slice().get(total_written..) {
+    log::debug!("Writing request...");
+
+    if !request.is_valid {
+        log::error!("Invalid request sent")
+    }
+
+    let buf = match request.as_slice().get(..request.raw_len) {
         Some(b) => b,
         None => {
             return Err(io::Error::new(
@@ -616,13 +698,14 @@ fn send_request<T: io::Write>(
 
     loop {
         *start = Some(total_written);
-        match io.write(buf) {
+        match io.write(&buf[total_written..]) {
             Ok(num_written) => total_written += num_written,
             Err(e) => return Err(e),
         }
 
-        if total_written == request.as_slice().len() {
+        if total_written == request.raw_len {
             *start = None;
+            log::debug!("Successfully wrote request.");
             return Ok(());
         }
     }
@@ -631,10 +714,16 @@ fn send_request<T: io::Write>(
 fn send_response<T: io::Write>(
     io: &mut T,
     response: &PostgresResponse,
-    state: &mut SessionState,
+    _state: &mut SessionState,
     start: &mut Option<usize>,
 ) -> io::Result<()> {
     let mut total_written = start.unwrap_or(0);
+
+    log::debug!("Writing response...");
+
+    if !response.is_valid {
+        log::error!("Invalid response sent")
+    }
 
     if start.is_some() && response.as_slice().len() <= total_written {
         return Err(io::Error::new(
@@ -643,15 +732,18 @@ fn send_response<T: io::Write>(
         ));
     }
 
+    let response_buf = &response.as_slice()[..response.raw_len];
+
     loop {
         *start = Some(total_written);
-        match io.write(&response.as_slice()[total_written..]) {
+        match io.write(&response_buf[total_written..]) {
             Ok(num_written) => total_written += num_written,
             Err(e) => return Err(e),
         }
 
-        if total_written == response.as_slice().len() {
+        if total_written == response_buf.len() {
             *start = None;
+            log::debug!("Successfully wrote response.");
             return Ok(());
         }
     }

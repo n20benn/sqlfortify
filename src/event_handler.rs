@@ -1,27 +1,27 @@
-//use log::{debug, error, info, trace, warn};
-use log::info;
+use log;
 use polling::{Event, Poller};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use std::{error, fmt, io};
 
-use crate::token::CheckParameters;
+use crate::sqli_detector;
 
 use super::key_pool::KeyPool;
 use super::proxy::{IOEvent, Proxy};
-use super::token::SqlToken;
-use super::validator::SqlValidator;
+use super::validator;
 
 use super::sql_session::ProxySession;
 
-// TODO: WARNING: unsafe code. Replace as soon as API replacement arrives
-// Fixed by: https://github.com/rust-lang/socket2/pull/311
-use libc::sockaddr_storage;
-fn copy_sockaddr(addr: &SockAddr) -> SockAddr {
-    unsafe {
-        let sockaddr_storage_ref = addr.as_ptr().cast::<sockaddr_storage>().as_ref().unwrap();
-        SockAddr::new(sockaddr_storage_ref.clone(), addr.len())
+pub struct Parameters {
+    pub validator_params: validator::Parameters,
+}
+
+impl Parameters {
+    pub fn default() -> Self {
+        Parameters {
+            validator_params: validator::Parameters::default(),
+        }
     }
 }
 
@@ -46,29 +46,48 @@ impl std::convert::From<std::io::Error> for HandlerError {
     }
 }
 
-pub struct EventHandler<T: SqlToken, P: ProxySession<Socket, Socket>> {
+pub struct EventHandler<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> {
     db_addr: SockAddr,
     db_key_map: HashMap<usize, usize>,
     key_pool: KeyPool,
     listener: Socket,
     listener_key: usize,
     poller: Poller,
-    proxies: HashMap<usize, Proxy<T, P>>,
-    validator: SqlValidator<T>,
+    proxies: HashMap<usize, Proxy<D, P>>,
+    validator: validator::SqlValidator<D>,
 }
 
-impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
+impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D, P> {
     pub fn new(
         listen_address: SockAddr,
         db_address: SockAddr,
-        sql_check_params: CheckParameters,
+        params: Parameters,
     ) -> Result<Self, HandlerError> {
         let listener = create_listener(&listen_address)?;
-        let poller = Poller::new()?;
+        let poller = match Poller::new() {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(HandlerError {
+                    reason: format!("failed to initialize poller: {}", e.to_string()),
+                })
+            }
+        };
         let mut pool = KeyPool::new();
         let listener_key = pool.take_key();
 
-        Ok(EventHandler::<T, P> {
+        match poller.add(&listener, Event::none(listener_key)) {
+            Ok(_) => (),
+            Err(e) => {
+                return Err(HandlerError {
+                    reason: format!(
+                        "failed to add listening socket to poller: {}",
+                        e.to_string()
+                    ),
+                })
+            }
+        };
+
+        Ok(EventHandler::<D, P> {
             db_addr: db_address,
             key_pool: pool,
             listener: listener,
@@ -76,7 +95,7 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
             poller: poller,
             proxies: HashMap::new(),
             db_key_map: HashMap::new(),
-            validator: SqlValidator::new(sql_check_params),
+            validator: validator::SqlValidator::new(params.validator_params),
         })
     }
 
@@ -87,15 +106,37 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
         loop {
             // If we still have connections to service in the queue, return additional connections immediately
             let timeout = if event_keys.len() > 0 {
+                log::debug!("Temporarily polling for new socket events");
                 Some(Duration::ZERO)
             } else {
+                log::debug!("Polling for new socket events indefinitely...");
                 None
             };
 
             // We always want our listening socket to be polled
-            self.poller
-                .modify(&self.listener, Event::readable(self.listener_key))?; // TODO: error handling here
-            self.poller.wait(&mut new_events, timeout)?;
+            match self
+                .poller
+                .modify(&self.listener, Event::readable(self.listener_key))
+            {
+                Ok(_) => (),
+                Err(e) => {
+                    return Err(HandlerError {
+                        reason: format!(
+                            "failed to poll read events on listening socket: {}",
+                            e.to_string()
+                        ),
+                    })
+                }
+            };
+
+            match self.poller.wait(&mut new_events, timeout) {
+                Ok(_) => (),
+                Err(e) => {
+                    return Err(HandlerError {
+                        reason: format!("poller error while awaiting events: {}", e.to_string()),
+                    })
+                }
+            };
 
             while let Some(ev) = new_events.pop() {
                 // No need to call events.clear(); this does it
@@ -129,33 +170,80 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
 
         match self.listener.accept() {
             Ok((new_client, new_client_addr)) => {
-                info!("Received new connection from client {:?}", new_client_addr);
+                match new_client_addr.as_socket() {
+                    Some(socket_addr) => {
+                        log::info!("Received new connection from client {}", socket_addr)
+                    }
+                    None => log::info!("Received new connection from client {:?}", new_client_addr),
+                }
 
-                let db_socket = create_db_socket(Domain::from(self.db_addr.family() as i32))?;
-                let db_key = self.key_pool.take_key();
+                match new_client.set_nonblocking(true) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        log::error!("Failed to set incoming client socket to nonblocking: {}", e);
+                        return Ok(());
+                    }
+                }
+
+                let backend_socket =
+                    match create_backend_socket(Domain::from(self.db_addr.family() as i32)) {
+                        Ok(sock) => sock,
+                        Err(e) => {
+                            log::error!("{}", e.reason);
+                            return Ok(()); // Fail gracefully in this case--we don't want an influx of new connections causing a db error to crash existing connections, that would be DOS
+                        }
+                    };
                 let client_key = self.key_pool.take_key();
+                let backend_key = self.key_pool.take_key();
+
+                match self.poller.add(&new_client, Event::none(client_key)) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        log::error!("Failed to add client socket to poller: {}", e);
+                        return Ok(());
+                    }
+                }
+                match self.poller.add(&backend_socket, Event::none(backend_key)) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        log::error!("Failed to add client socket to poller: {}", e);
+                        return Ok(());
+                    }
+                }
 
                 self.proxies.insert(
                     client_key,
                     Proxy::new(
-                        new_client,
-                        db_socket,
-                        copy_sockaddr(&self.db_addr),
+                        self.db_addr.clone(),
+                        backend_key,
+                        backend_socket,
+                        new_client_addr.clone(),
                         client_key,
-                        db_key,
+                        new_client,
                     ),
                 );
-                event_keys.insert(client_key, (true, false)); // Necessary to call `connect()` on db_socket
+
+                self.db_key_map.insert(backend_key, client_key);
+                event_keys.insert(client_key, (true, false)); // Necessary to call `connect` on db_socket
+
+                match new_client_addr.as_socket() {
+                    Some(socket_addr) => log::info!(
+                        "Successfully initialized connection for client {}",
+                        socket_addr
+                    ),
+                    None => log::info!(
+                        "Successfully initialized connection for client {:?}",
+                        new_client_addr
+                    ),
+                }
             }
             Err(e) => match e.kind() {
                 io::ErrorKind::WouldBlock
                 | io::ErrorKind::TimedOut
                 | io::ErrorKind::Interrupted => (),
-                io::ErrorKind::ConnectionAborted | io::ErrorKind::PermissionDenied => {
-                    info!("Listener failed to accept new connection: {}", e);
-                    // Permission denied means that Linux firewall blocked connection
-                }
-                _ => return Err(HandlerError::from(e)), // Unrecoverable error on listener (very rare)
+                // io::ErrorKind::ConnectionAborted | io::ErrorKind::PermissionDenied => { }
+                // Permission denied means that Linux firewall blocked connection
+                _ => log::info!("Listener failed to accept new connection: {}", e),
             },
         }
 
@@ -168,75 +256,125 @@ impl<T: SqlToken, P: ProxySession<Socket, Socket>> EventHandler<T, P> {
     ) -> Result<(), HandlerError> {
         let mut queue = VecDeque::from_iter(event_keys.drain());
 
-        while let Some((key, (incoming, outgoing))) = queue.pop_front() {
-            let proxy = match self.proxies.get_mut(&key) {
+        while let Some((frontend_key, (incoming, outgoing))) = queue.pop_front() {
+            let proxy = match self.proxies.get_mut(&frontend_key) {
                 Some(c) => c,
-                None => continue, // Shouldn't really happen
+                None => {
+                    // This should never happen
+                    log::warn!("Proxy information missing for event key {}", frontend_key);
+                    log::debug!(
+                        "Event key had incoming flag set to {}, outgoing flag set to {}",
+                        incoming,
+                        outgoing
+                    );
+                    continue;
+                }
             };
+
+            let client_name = match proxy.get_frontend_address().as_socket() {
+                Some(socket_addr) => socket_addr.to_string(),
+                None => "<unknown_addr_type>".to_string(),
+            };
+
+            log::debug!(
+                "Handling event for client proxy {} with event key {}",
+                client_name,
+                frontend_key
+            );
 
             let mut still_incoming = false;
             let mut still_outgoing = false;
 
-            let mut client_events = IOEvent::None;
-            let mut db_events = IOEvent::None;
+            let mut frontend_events = IOEvent::None;
+            let mut backend_events = IOEvent::None;
 
             if outgoing {
+                log::debug!(
+                    "Processing outgoing packets for client proxy {} with event key {}",
+                    client_name,
+                    frontend_key
+                );
                 match proxy.process_outgoing(&mut self.validator) {
                     Ok((IOEvent::None, IOEvent::None)) => still_outgoing = true,
                     Ok((client_need, db_need)) => {
-                        client_events |= client_need;
-                        db_events |= db_need;
+                        frontend_events |= client_need;
+                        backend_events |= db_need;
                     }
-                    Err(_) => {
-                        // TODO: log socket's error `e` here
+                    Err(e) => {
+                        log::info!(
+                            "Proxy for client {} closed while processing outgoing packets - {}",
+                            client_name,
+                            e.to_string()
+                        );
                         // Clean up proxy's resources
-                        self.key_pool.return_key(proxy.get_client_key());
-                        self.key_pool.return_key(proxy.get_db_key());
+                        self.key_pool.return_key(proxy.get_frontend_key());
+                        self.key_pool.return_key(proxy.get_backend_key());
 
-                        self.db_key_map.remove(&proxy.get_db_key());
-                        self.proxies.remove(&key); // Allows `proxy` to be freed up
-                                                   // TODO: log errors in `remove()` calls here
+                        self.db_key_map.remove(&proxy.get_backend_key());
+                        self.proxies.remove(&frontend_key); // Allows `proxy` to be freed up
                         continue; // Error was unrecoverable, so no sense processing incoming or re-adding socket to polling
                     }
                 };
             }
 
             if incoming {
+                log::debug!(
+                    "Processing incoming packets for client proxy {} with event key {}",
+                    client_name,
+                    frontend_key
+                );
                 match proxy.process_incoming(&mut self.validator) {
-                    Ok((IOEvent::None, IOEvent::None)) => still_incoming = !proxy.incoming_closed(), // If incoming sockets are closed, don't continue trying to process incoming packets
-                    Ok((client_need, db_need)) => {
-                        client_events |= client_need;
-                        db_events |= db_need;
+                    Ok((IOEvent::None, IOEvent::None)) => {
+                        still_incoming = !proxy.no_more_incoming()
+                    } // If incoming sockets are closed, don't continue trying to process incoming packets
+                    Ok((frontend_need, backend_need)) => {
+                        frontend_events |= frontend_need;
+                        backend_events |= backend_need;
                     }
-                    Err(_) => {
-                        // TODO: log socket's error `e` here
+                    Err(e) => {
+                        log::info!(
+                            "Proxy for client {} closed while processing incoming packets - {}",
+                            client_name,
+                            e.to_string()
+                        );
                         // Clean up proxy's resources
-                        self.key_pool.return_key(proxy.get_client_key());
-                        self.key_pool.return_key(proxy.get_db_key());
+                        self.key_pool.return_key(proxy.get_frontend_key());
+                        self.key_pool.return_key(proxy.get_backend_key());
 
-                        self.db_key_map.remove(&proxy.get_db_key());
-                        self.proxies.remove(&key); // Allows `proxy` to be freed up
-                                                   // TODO: log errors in `remove()` calls here
+                        self.db_key_map.remove(&proxy.get_backend_key());
+                        self.proxies.remove(&frontend_key); // Allows `proxy` to be freed up
                         continue; // Error was unrecoverable, so no sense processing incoming or re-adding socket to polling
                     }
                 };
             }
 
-            if still_outgoing || still_incoming {
-                event_keys.insert(key, (still_incoming, still_outgoing)); // Re-add key to event keys so that it will be handled immediately
+            if still_incoming || still_outgoing {
+                log::debug!("Proxy was still_incoming or still_outgoing--put back into event_keys");
+                event_keys.insert(frontend_key, (still_incoming, still_outgoing));
+                // Re-add key to event keys so that it will be handled immediately
             }
 
-            if client_events != IOEvent::None {
+            if !still_incoming && !proxy.no_more_incoming() {
+                frontend_events |= IOEvent::Read;
+            }
+
+            if !still_outgoing {
+                backend_events |= IOEvent::Read;
+            }
+
+            if frontend_events != IOEvent::None {
+                log::debug!("Frontend events were not none--adding proxy frontend to poller");
                 self.poller.modify(
-                    proxy.get_client_socket(),
-                    match_event(client_events, proxy.get_client_key()),
+                    proxy.get_frontend_socket(),
+                    match_event(frontend_events, proxy.get_frontend_key()),
                 )?;
             }
 
-            if db_events != IOEvent::None {
+            if backend_events != IOEvent::None {
+                log::debug!("Backend events were not none--adding proxy backend to poller");
                 self.poller.modify(
-                    proxy.get_db_socket(),
-                    match_event(db_events, proxy.get_db_key()),
+                    proxy.get_backend_socket(),
+                    match_event(backend_events, proxy.get_backend_key()),
                 )?;
             }
         }
@@ -254,18 +392,91 @@ fn match_event(res: IOEvent, key: usize) -> Event {
     }
 }
 
-fn create_listener(listen_address: &SockAddr) -> io::Result<Socket> {
-    let listener = Socket::new(Domain::IPV4, Type::STREAM, None)?; // TODO: support IPv6; add error checks
-    listener.set_nonblocking(true)?;
-    listener.bind(&listen_address)?;
-    listener.listen(4096)?; // Maximum number of backlogged connections
+fn create_listener(listen_address: &SockAddr) -> Result<Socket, HandlerError> {
+    let family = match listen_address.family() as i32 {
+        libc::AF_INET => Domain::IPV4,
+        libc::AF_INET6 => Domain::IPV6,
+        _ => {
+            return Err(HandlerError {
+                reason: format!(
+                    "unrecognized family for specified listener address {}",
+                    listen_address.family()
+                ),
+            })
+        }
+    };
+
+    let listener = match Socket::new(family, Type::STREAM, None) {
+        Ok(sock) => sock,
+        Err(e) => {
+            return Err(HandlerError {
+                reason: format!("socket creation for listener failed: {}", e.to_string()),
+            })
+        }
+    };
+
+    match listener.set_nonblocking(true) {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(HandlerError {
+                reason: format!(
+                    "listening socket could not be set to nonblocking: {}",
+                    e.to_string()
+                ),
+            })
+        }
+    };
+
+    match listener.bind(&listen_address) {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(HandlerError {
+                reason: format!(
+                    "listening socket could not be bound to the desired address: {}",
+                    e.to_string()
+                ),
+            })
+        }
+    };
+    match listener.listen(4096) {
+        // Maximum number of backlogged connections
+        Ok(_) => (),
+        Err(e) => {
+            return Err(HandlerError {
+                reason: format!(
+                    "server socket failed to listen for new connections: {}",
+                    e.to_string()
+                ),
+            })
+        }
+    };
     Ok(listener)
 }
 
-fn create_db_socket(family: Domain) -> io::Result<Socket> {
-    let db_socket = Socket::new(family, Type::STREAM, None)?;
-    // TODO: future support for IPV6, Unix Domain sockets here...
-    db_socket.set_nonblocking(true)?; // TODO: error handling here
+fn create_backend_socket(family: Domain) -> Result<Socket, HandlerError> {
+    let db_socket = match Socket::new(family, Type::STREAM, None) {
+        Ok(sock) => sock,
+        Err(e) => {
+            return Err(HandlerError {
+                reason: format!(
+                    "failed to create new socket to connect to backend: {}",
+                    e.to_string()
+                ),
+            })
+        }
+    };
+
+    match db_socket.set_nonblocking(true) {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(HandlerError {
+                reason: format!(
+                    "failed to make database socket nonblocking: {}",
+                    e.to_string()
+                ),
+            })
+        }
+    };
 
     Ok(db_socket)
 }
