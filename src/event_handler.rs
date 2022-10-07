@@ -178,17 +178,17 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
 
         match self.listener.accept() {
             Ok((new_client, new_client_addr)) => {
-                match new_client_addr.as_socket() {
-                    Some(socket_addr) => {
-                        log::info!("Received new connection from client {}", socket_addr)
-                    }
-                    None => log::info!("Received new connection from client {:?}", new_client_addr),
-                }
+                let client_addr_name = match new_client_addr.as_socket() {
+                    Some(socket_addr) => socket_addr.to_string(),
+                    None => "<unknown_addr_type>".to_string(),
+                };
+
+                log::info!("Received new connection from client {}", client_addr_name);
 
                 match new_client.set_nonblocking(true) {
                     Ok(_) => (),
                     Err(e) => {
-                        log::error!("Failed to set incoming client socket to nonblocking: {}", e);
+                        log::error!("Failed to set {} client socket to nonblocking: {}", client_addr_name, e);
                         return Ok(());
                     }
                 }
@@ -207,17 +207,19 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                 match self.poller.add(&new_client, Event::none(client_key)) {
                     Ok(_) => (),
                     Err(e) => {
-                        log::error!("Failed to add client socket to poller: {}", e);
+                        log::error!("Failed to add {} client socket to poller: {}", client_addr_name, e);
                         return Ok(());
                     }
                 }
                 match self.poller.add(&backend_socket, Event::none(backend_key)) {
                     Ok(_) => (),
                     Err(e) => {
-                        log::error!("Failed to add client socket to poller: {}", e);
+                        log::error!("Failed to add {} client socket to poller: {}", client_addr_name, e);
                         return Ok(());
                     }
                 }
+
+                log::info!("Successfully initialized connection for client {}", client_addr_name);
 
                 self.proxies.insert(
                     client_key,
@@ -225,7 +227,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                         self.db_addr.clone(),
                         backend_key,
                         backend_socket,
-                        new_client_addr.clone(),
+                        client_addr_name,
                         client_key,
                         new_client,
                     ),
@@ -233,17 +235,6 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
 
                 self.db_key_map.insert(backend_key, client_key);
                 event_keys.insert(client_key, (true, false)); // Necessary to call `connect` on db_socket
-
-                match new_client_addr.as_socket() {
-                    Some(socket_addr) => log::info!(
-                        "Successfully initialized connection for client {}",
-                        socket_addr
-                    ),
-                    None => log::info!(
-                        "Successfully initialized connection for client {:?}",
-                        new_client_addr
-                    ),
-                }
             }
             Err(e) => match e.kind() {
                 io::ErrorKind::WouldBlock
@@ -256,6 +247,38 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
         }
 
         Ok(())
+    }
+
+    fn cleanup_proxy(&mut self, proxy_key: usize) {
+        let proxy = match self.proxies.remove(&proxy_key) {
+            Some(proxy) => proxy,
+            None => {
+                log::warn!("Wrong key passed to event handler to clean up proxy resources: key {} had no associated proxy", proxy_key);
+                return;
+            }
+        };
+
+        self.key_pool.return_key(proxy_key);
+        self.key_pool.return_key(proxy.get_backend_key());
+
+        self.db_key_map.remove(&proxy.get_backend_key());
+        self.proxies.remove(&proxy_key); // Allows `proxy` to be freed up
+        match self.poller.delete(proxy.get_frontend_socket()) {
+            Ok(()) => (),
+            Err(e) => log::warn!(
+                "Proxy frontend for socket {} couldn't be removed from poller during cleanup: {}",
+                proxy.get_frontend_address(),
+                e
+            ),
+        }
+        match self.poller.delete(proxy.get_backend_socket()) {
+            Ok(()) => (),
+            Err(e) => log::warn!(
+                "Proxy backend for socket {} couldn't be removed from poller during cleanup: {}",
+                proxy.get_frontend_address(),
+                e
+            ),
+        }
     }
 
     fn handle_queue(
@@ -279,14 +302,9 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                 }
             };
 
-            let client_name = match proxy.get_frontend_address().as_socket() {
-                Some(socket_addr) => socket_addr.to_string(),
-                None => "<unknown_addr_type>".to_string(),
-            };
-
             log::debug!(
                 "Handling event for client proxy {} with event key {}",
-                client_name,
+                proxy.get_frontend_address(),
                 frontend_key
             );
 
@@ -299,8 +317,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
             if outgoing {
                 log::debug!(
                     "Processing outgoing packets for client proxy {} with event key {}",
-                    client_name,
-                    frontend_key
+                    proxy.get_frontend_address(),
+                    frontend_key,
                 );
                 match proxy.process_outgoing(&mut self.validator) {
                     Ok(res) => {
@@ -311,7 +329,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                     Err(e) => {
                         log::info!(
                             "Proxy for client {} closed while processing outgoing packets - {}",
-                            client_name,
+                            frontend_key,
                             e.to_string()
                         );
                         // Clean up proxy's resources
@@ -328,7 +346,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
             if incoming {
                 log::debug!(
                     "Processing incoming packets for client proxy {} with event key {}",
-                    client_name,
+                    proxy.get_frontend_address(),
                     frontend_key
                 );
                 match proxy.process_incoming(&mut self.validator) {
@@ -340,15 +358,11 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                     Err(e) => {
                         log::info!(
                             "Proxy for client {} closed while processing incoming packets - {}",
-                            client_name,
+                            proxy.get_frontend_address(),
                             e.to_string()
                         );
-                        // Clean up proxy's resources
-                        self.key_pool.return_key(proxy.get_frontend_key());
-                        self.key_pool.return_key(proxy.get_backend_key());
 
-                        self.db_key_map.remove(&proxy.get_backend_key());
-                        self.proxies.remove(&frontend_key); // Allows `proxy` to be freed up
+                        self.cleanup_proxy(frontend_key);
                         continue; // Error was unrecoverable, so no sense processing incoming or re-adding socket to polling
                     }
                 };
@@ -400,7 +414,7 @@ fn create_listener(listen_address: &SockAddr) -> Result<Socket, HandlerError> {
         _ => {
             return Err(HandlerError {
                 reason: format!(
-                    "unrecognized family for specified listener address {}",
+                    "unrecognized family '{}' for specified listener address",
                     listen_address.family()
                 ),
             })

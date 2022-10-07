@@ -106,7 +106,7 @@ pub struct Proxy<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> {
     backend_key: usize,
     backend_read_closed: bool,
     backend_write_closed: bool,
-    frontend_address: SockAddr,
+    frontend_address: String,
     frontend_key: usize,
     frontend_read_closed: bool,
     incoming_data: VecDeque<P::RequestType>,
@@ -132,7 +132,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         backend_address: SockAddr,
         backend_key: usize,
         backend_socket: Socket,
-        frontend_address: SockAddr,
+        frontend_address: String,
         frontend_key: usize,
         frontend_socket: Socket,
     ) -> Self {
@@ -153,9 +153,9 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         }
     }
 
-    /// Returns the polling key associated with the client socket of the given proxy.
-    pub fn get_frontend_key(&self) -> usize {
-        self.frontend_key
+    /// Returns the polling key associated with the database socket of the given proxy.
+    pub fn get_backend_key(&self) -> usize {
+        self.backend_key
     }
 
     /// Returns the client socket of the given proxy connection.
@@ -163,13 +163,13 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         self.sql_session.get_backend_io_ref()
     }
 
-    pub fn get_frontend_address(&self) -> &SockAddr {
-        &self.frontend_address
+    pub fn get_frontend_address<'a>(&'a self) -> &'a str {
+        self.frontend_address.as_str()
     }
 
-    /// Returns the polling key associated with the database socket of the given proxy.
-    pub fn get_backend_key(&self) -> usize {
-        self.backend_key
+    /// Returns the polling key associated with the client socket of the given proxy.
+    pub fn get_frontend_key(&self) -> usize {
+        self.frontend_key
     }
 
     /// Returns the database socket of the given proxy.
@@ -350,7 +350,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         if self.frontend_read_closed {
             log::debug!("Not reading any new requests as frontend read end is closed");
             if !self.backend_write_closed && self.incoming_data.len() == 0 {
-                log::info!("No more packets to forward to backend and frontend read closed--closing backend write");
+                log::info!("No more packets to forward to backend and frontend read closed--closing backend write for {}", self.frontend_address.as_str());
                 self.get_backend_socket().shutdown(net::Shutdown::Write)?; // No more data to process, so close other half of the incoming stream
                 self.backend_write_closed = true;
             }
@@ -365,7 +365,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         let mut request = match self.sql_session.frontend_receive_request() {
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                log::info!("Frontend read closed--no more new incoming packets");
+                log::info!("Frontend read closed--no more new incoming packets for {}", self.frontend_address.as_str());
                 self.frontend_read_closed = true;
                 return Ok(ProxyResult::none());
             }
@@ -406,7 +406,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         }
 
         if let Some(query) = request.get_basic_info().query.as_ref() {
-            log::info!("SQL query received from frontend--checking for SQL injection attempts...");
+            log::info!("SQL query received from frontend for {}--checking for SQL injection attempts...", self.frontend_address.as_str());
             match validator.check_query(query.as_str()) {
                 Err(e) => {
                     log::warn!("SQL injection detected in query: {}", e);
@@ -443,9 +443,6 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
 
     fn proxy_data_to_backend(&mut self) -> io::Result<ProxyResult> {
         if self.backend_write_closed {
-            log::warn!(
-                "proxy_data_to_backend called despite backend socket's write end being closed"
-            );
             return Ok(ProxyResult::none());
         }
 
@@ -456,7 +453,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             match self.sql_session.backend_send_request(&request) {
                 Ok(()) => self.sql_session.recycle_request(request),
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                    log::info!("Backend write end closed--closing frontend read end and backend");
+                    log::info!("Backend write end closed--closing frontend read end and backend for {}", self.frontend_address.as_str());
                     if !self.frontend_read_closed {
                         self.frontend_read_closed = true;
                         match self.get_frontend_socket().shutdown(net::Shutdown::Read) {
@@ -465,7 +462,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                                 return Err(io::Error::new(
                                     io::ErrorKind::ConnectionAborted,
                                     format!(
-                                "error when attempting to close frontend socket read end: {}",
+                                "error when attempting to close {} frontend socket read end: {}",
+                                self.frontend_address.as_str(),
                                 e.to_string()
                             ),
                                 ))
@@ -488,7 +486,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             match self.get_backend_socket().shutdown(net::Shutdown::Write) {
                 Ok(_) => (),
                 Err(e) => log::info!(
-                    "error when closing backend socket write end: {}",
+                    "error when closing {} backend socket write end: {}",
+                    self.frontend_address.as_str(),
                     e.to_string()
                 ),
             }
@@ -511,14 +510,14 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         }
 
         if self.backend_read_closed {
-            log::debug!("Not reading any new responses as backend read end is closed");
+            log::debug!("Not reading any new responses as backend read end for {} is closed", self.frontend_address.as_str());
             return Ok(ProxyResult::none()); // We're not going to receive any new packets, so stop here
         }
 
         // Remove any requests from the queue that are to be spoofed with error responses
         while let Some(request_info) = self.request_queue.pop_front() {
             if request_info.is_malicious {
-                log::debug!("Malicious query response packets injected into stream");
+                log::debug!("Error response packets injected into stream for malicious query");
                 self.outgoing_data
                     .push_back(self.sql_session.error_response());
             } else {
@@ -537,7 +536,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         let response = match self.sql_session.backend_receive_response() {
             Ok(resp) => resp,
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                log::info!("Backend write end closed--closing incoming stream (read end of frontend and write end of backend)");
+                log::info!("Backend write end closed--closing incoming stream for {} (read end of frontend and write end of backend)", self.frontend_address.as_str());
                 self.backend_read_closed = true;
                 if !self.frontend_read_closed {
                     self.frontend_read_closed = true; // If we can't get data from our db, no sense in accepting new data from our client
@@ -547,7 +546,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                             return Err(io::Error::new(
                                 io::ErrorKind::ConnectionAborted,
                                 format!(
-                                    "error when closing frontend socket read end: {}",
+                                    "error when closing {} frontend socket read end: {}",
+                                    self.frontend_address.as_str(),
                                     e.to_string()
                                 ),
                             ))
@@ -559,7 +559,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                     match self.get_backend_socket().shutdown(net::Shutdown::Write) {
                         Ok(_) => (),
                         Err(e) => log::warn!(
-                            "error when attempting to close backend socket write end: {}",
+                            "error when attempting to close {} backend socket write end: {}",
+                            self.frontend_address.as_str(),
                             e.to_string()
                         ),
                     };
@@ -589,7 +590,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                 // Somehow, we received one more response from the database than what we were expecting. This is BAD (as it could lead to erroneous data and errors being passed to the application, not to mention request smuggling...)
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "proxy request/response flow became desynchronized",
+                    format!("proxy request/response flow became desynchronized for {}", self.frontend_address.as_str()),
                 ));
             }
         }
@@ -610,12 +611,12 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             match self.sql_session.frontend_send_response(&response) {
                 Ok(()) => log::debug!("Successfully forwarded response to frontend"),
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                    log::info!("Frontend write end closed--closing all sockets and freeing proxy resources");
+                    log::info!("Frontend write end closed--closing all sockets for {} and freeing proxy resources", self.frontend_address.as_str());
                     // Close proxy according to TCP spec
                     self.get_frontend_socket().shutdown(net::Shutdown::Write)?;
                     self.get_frontend_socket().shutdown(net::Shutdown::Read)?;
                     self.get_backend_socket().shutdown(net::Shutdown::Read)?;
-                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "client unexpectedly closed connection despite data remaining to be returned"));
+                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("{} client unexpectedly closed connection despite data remaining to be returned", self.frontend_address.as_str())));
                 }
                 Err(e) => {
                     self.outgoing_data.push_front(response); // we assume this could be a recoverable error, such as EWOULDBLOCK
@@ -631,11 +632,11 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         if self.backend_read_closed {
             match self.get_frontend_socket().shutdown(net::Shutdown::Write) {
                 Ok(_) => (),
-                Err(e) => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("connection otherwise gracefully terminated, but error when closing frontend socket write end: {}", e.to_string()))),
+                Err(e) => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("connection otherwise gracefully terminated, but error when closing {} frontend socket write end: {}", self.frontend_address.as_str(), e.to_string()))),
             }
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                "connection gracefully terminated (no more packets from database)",
+                format!("{} connection gracefully terminated (no more packets from database)", self.frontend_address.as_str()),
             ));
         }
 
