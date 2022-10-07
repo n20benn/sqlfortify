@@ -9,7 +9,8 @@ use std::{io, net, ops};
 use super::validator::SqlValidator;
 
 /// The maximum number of requests or responses to buffer in each direction
-const BUFFER_SOFT_LIMIT: usize = 10;
+const REQUEST_QUEUE_SOFT_LIMIT: usize = 10;
+const RESPONSE_QUEUE_SOFT_LIMIT: usize = 10;
 
 const CODE_EINPROGRESS: i32 = 115;
 const CODE_EISCONNECTED: i32 = 106;
@@ -32,7 +33,7 @@ enum ConnectionState {
 
 /// Enumerates the read/write events that a socket cannot send/receive data for
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum IOEvent {
+pub enum IONeed {
     /// Indicates that no read or write events on the socket have failed
     None,
     /// Indicates that data could not be read from the socket without blocking
@@ -43,22 +44,57 @@ pub enum IOEvent {
     ReadWrite,
 }
 
-impl ops::BitOr for IOEvent {
+impl ops::BitOr for IONeed {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (IOEvent::ReadWrite, _) | (_, IOEvent::None) => self,
-            (_, IOEvent::ReadWrite) | (IOEvent::None, _) => rhs,
-            (IOEvent::Read, IOEvent::Write) | (IOEvent::Write, IOEvent::Read) => IOEvent::ReadWrite,
+            (IONeed::ReadWrite, _) | (_, IONeed::None) => self,
+            (_, IONeed::ReadWrite) | (IONeed::None, _) => rhs,
+            (IONeed::Read, IONeed::Write) | (IONeed::Write, IONeed::Read) => IONeed::ReadWrite,
             _ => self, // can only be (Write, Write) or (Read, Read)
         }
     }
 }
 
-impl ops::BitOrAssign for IOEvent {
+impl ops::BitOrAssign for IONeed {
     fn bitor_assign(&mut self, rhs: Self) {
         *self = *self | rhs // Uses bitor() function to properly assign left-hand side
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ProxyResult {
+    pub frontend: IONeed,
+    pub backend: IONeed,
+    pub should_retry: bool,
+}
+
+impl ProxyResult {
+    fn none() -> Self {
+        ProxyResult {
+            frontend: IONeed::None,
+            backend: IONeed::None,
+            should_retry: false,
+        }
+    }
+}
+
+impl ops::BitOr for ProxyResult {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        ProxyResult {
+            frontend: self.frontend | rhs.frontend,
+            backend: self.backend | rhs.backend,
+            should_retry: self.should_retry | rhs.should_retry,
+        }
+    }
+}
+
+impl ops::BitOrAssign for ProxyResult {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs
     }
 }
 
@@ -136,14 +172,14 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         self.backend_key
     }
 
-    /// Returns `true` if no more packets remain to be sent to the backend and the frontend client has closed its write end
-    pub fn no_more_incoming(&self) -> bool {
-        self.frontend_read_closed && self.backend_write_closed
-    }
-
     /// Returns the database socket of the given proxy.
     pub fn get_frontend_socket(&self) -> &Socket {
         self.sql_session.get_frontend_io_ref()
+    }
+
+    /// Returns `true` if no more packets remain to be sent to the backend and the frontend client has closed its write end
+    pub fn no_more_incoming(&self) -> bool {
+        self.frontend_read_closed && self.backend_write_closed
     }
 
     /// Progresses the state of the given proxy connection by attempting each of the following operations once,
@@ -155,11 +191,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
     ///
     /// Returns a tuple indicating the read/write events needed on the proxy's client socket and database socket (in that order).
     ///
-    pub fn process_incoming(
-        &mut self,
-        validator: &mut SqlValidator<D>,
-    ) -> io::Result<(IOEvent, IOEvent)> {
-        let (mut frontend_ev, mut backend_ev) = (IOEvent::None, IOEvent::None);
+    pub fn process_incoming(&mut self, validator: &mut SqlValidator<D>) -> io::Result<ProxyResult> {
+        let mut res = ProxyResult::none();
 
         /*
         if self.state == State::ClientTLSHandshake {
@@ -168,9 +201,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         */
 
         if self.state == ConnectionState::DatabaseTCPHandshake {
-            let (new_frontend_ev, new_backend_ev) = self.connect_backend()?;
-            frontend_ev |= new_frontend_ev;
-            backend_ev |= new_backend_ev;
+            res |= self.connect_backend()?;
         }
 
         /*
@@ -181,29 +212,32 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
 
         if self.state == ConnectionState::Connected {
             // Only go through one round of each phase to ensure fairness at the EventHandler layer
-            let mut frontend_should_write: bool = false;
-            frontend_ev |= match self.process_frontend_data(validator, &mut frontend_should_write) {
-                Ok(()) => IOEvent::None,
+            res |= match self.process_frontend_data(validator) {
+                Ok(needs) => needs,
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Read,
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ProxyResult {
+                        frontend: IONeed::Read,
+                        backend: IONeed::None,
+                        should_retry: false,
+                    },
                     _ => return Err(e),
                 },
             };
 
-            if frontend_should_write {
-                frontend_ev |= IOEvent::Write;
-            }
-
-            backend_ev |= match self.proxy_data_to_backend() {
-                Ok(()) => IOEvent::None,
+            res |= match self.proxy_data_to_backend() {
+                Ok(needs) => needs,
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Write,
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ProxyResult {
+                        frontend: IONeed::None,
+                        backend: IONeed::Write,
+                        should_retry: false,
+                    },
                     _ => return Err(e),
                 },
             };
         }
 
-        Ok((frontend_ev, backend_ev))
+        Ok(res)
     }
 
     /// Progresses the state of the given proxy connection by attempting each of the following operations once,
@@ -215,11 +249,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
     ///
     /// Returns a tuple indicating the read/write events needed on the proxy's client socket and database socket (in that order).
     ///
-    pub fn process_outgoing(
-        &mut self,
-        validator: &mut SqlValidator<D>,
-    ) -> io::Result<(IOEvent, IOEvent)> {
-        let (mut frontend_ev, mut backend_ev) = (IOEvent::None, IOEvent::None);
+    pub fn process_outgoing(&mut self, validator: &mut SqlValidator<D>) -> io::Result<ProxyResult> {
+        let mut res = ProxyResult::none();
 
         /*
         if self.state == State::ClientTLSHandshake {
@@ -242,36 +273,48 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         if self.state == ConnectionState::Connected {
             // Only go through one round of each phase to ensure fairness at the EventHandler layer
 
-            backend_ev |= match self.process_backend_data(validator) {
-                Ok(()) => IOEvent::None,
+            res |= match self.process_backend_data(validator) {
+                Ok(needs) => needs,
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Read,
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ProxyResult {
+                        frontend: IONeed::None,
+                        backend: IONeed::Read,
+                        should_retry: false,
+                    },
                     _ => return Err(e),
                 },
             };
 
-            frontend_ev |= match self.proxy_data_to_frontend() {
-                Ok(()) => IOEvent::None,
+            res |= match self.proxy_data_to_frontend() {
+                Ok(needs) => needs,
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => IOEvent::Write,
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ProxyResult {
+                        frontend: IONeed::Write,
+                        backend: IONeed::None,
+                        should_retry: false,
+                    },
                     _ => return Err(e),
                 },
             };
         }
 
-        Ok((frontend_ev, backend_ev))
+        Ok(res)
     }
 
     /// Attempts to establish a proxy connection to the backend database.
-    fn connect_backend(&mut self) -> io::Result<(IOEvent, IOEvent)> {
+    fn connect_backend(&mut self) -> io::Result<ProxyResult> {
         match self.get_backend_socket().connect(&self.backend_address) {
-            Ok(_) => {
+            Ok(()) => {
                 log::debug!(
                     "Connection to database completed for socket with key {}",
                     self.get_backend_key()
                 );
                 self.state = ConnectionState::Connected;
-                Ok((IOEvent::Read, IOEvent::Read))
+                Ok(ProxyResult {
+                    frontend: IONeed::Read,
+                    backend: IONeed::Read,
+                    should_retry: false,
+                })
             }
             Err(e) if e.raw_os_error() == Some(CODE_EISCONNECTED) => {
                 log::debug!(
@@ -279,14 +322,22 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                     self.get_backend_key()
                 );
                 self.state = ConnectionState::Connected;
-                Ok((IOEvent::Read, IOEvent::Read))
+                Ok(ProxyResult {
+                    frontend: IONeed::Read,
+                    backend: IONeed::Read,
+                    should_retry: false,
+                })
             }
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock
                     || e.raw_os_error() == Some(CODE_EINPROGRESS) =>
             {
                 log::debug!("Connection to database blocked");
-                Ok((IOEvent::None, IOEvent::Write))
+                Ok(ProxyResult {
+                    frontend: IONeed::None,
+                    backend: IONeed::Write,
+                    should_retry: false,
+                })
             }
             Err(e) => Err(e),
         }
@@ -295,8 +346,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
     fn process_frontend_data(
         &mut self,
         validator: &mut SqlValidator<D>,
-        frontend_should_write: &mut bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<ProxyResult> {
         if self.frontend_read_closed {
             log::debug!("Not reading any new requests as frontend read end is closed");
             if !self.backend_write_closed && self.incoming_data.len() == 0 {
@@ -304,36 +354,41 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                 self.get_backend_socket().shutdown(net::Shutdown::Write)?; // No more data to process, so close other half of the incoming stream
                 self.backend_write_closed = true;
             }
-            return Ok(());
+            return Ok(ProxyResult::none());
         }
 
-        if self.incoming_data.len() >= BUFFER_SOFT_LIMIT {
+        if self.incoming_data.len() >= REQUEST_QUEUE_SOFT_LIMIT {
             log::debug!("Deferring reading additional packets as incoming stream has filled its buffer allowance");
-            return Ok(()); // Defer receiving requests until the buffer has had time to be drained
+            return Ok(ProxyResult::none()); // Defer receiving requests until the buffer has had time to be drained
         }
 
         let mut request = match self.sql_session.frontend_receive_request() {
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                 log::info!("Frontend read closed--no more new incoming packets");
-                self.frontend_read_closed = true; // TODO: make sure that the socket actually has `shutdown()` called on it in the appropriate location
-                return Ok(());
+                self.frontend_read_closed = true;
+                return Ok(ProxyResult::none());
             }
             Err(e) => return Err(e),
         };
 
         log::debug!("Successfully received request from frontend");
 
+        let mut io_needs = ProxyResult {
+            frontend: IONeed::None,
+            backend: IONeed::None,
+            should_retry: true,
+        };
         if request.get_basic_info().gssenc_requested {
             log::warn!("Frontend attempted to encrypt stream with GSSAPI (not supported)--session encryption downgraded");
             if let Some(resp) = self.sql_session.frontend_downgrade_gssenc(&mut request) {
                 self.outgoing_data.push_back(resp);
-                *frontend_should_write = true;
+                io_needs.frontend |= IONeed::Write; // To ensure that the frontend gets this packet written out
             }
 
             if !request.is_valid() {
                 // if is_valid set to `false` then the request is not to be forwarded
-                return Ok(());
+                return Ok(io_needs);
             }
         }
 
@@ -341,12 +396,12 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             log::warn!("Frontend attempted to encrypt stream with SSL (not supported)--session encryption downgraded");
             if let Some(resp) = self.sql_session.frontend_downgrade_ssl(&mut request) {
                 self.outgoing_data.push_back(resp);
-                *frontend_should_write = true;
+                io_needs.frontend |= IONeed::Write; // To ensure that the frontend gets this packet written out
             }
 
             if !request.is_valid() {
                 // if is_valid set to `false` then the request is not to be forwarded
-                return Ok(());
+                return Ok(io_needs);
             }
         }
 
@@ -360,7 +415,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                         is_malicious: true,
                     });
 
-                    *frontend_should_write = true;
+                    io_needs.frontend |= IONeed::Write; // To ensure that the frontend gets this packet written out
                 }
                 Ok(()) => {
                     log::info!("SQL query was benign");
@@ -383,18 +438,20 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             self.incoming_data.push_back(request);
         }
 
-        Ok(())
+        Ok(io_needs)
     }
 
-    fn proxy_data_to_backend(&mut self) -> io::Result<()> {
+    fn proxy_data_to_backend(&mut self) -> io::Result<ProxyResult> {
         if self.backend_write_closed {
             log::warn!(
                 "proxy_data_to_backend called despite backend socket's write end being closed"
             );
-            return Ok(());
+            return Ok(ProxyResult::none());
         }
 
-        if let Some(request) = self.incoming_data.pop_front() {
+        // NOTE: chould change these while loops to `if` and return ProxyResult { frontend: IONeed::None, backend: IONeed::None, do_again: self.incoming_data.len() > 0 }
+        // But only if we feel like this while loop could be enough for one client to starve others of resources (very unlikely if even at all possible)
+        while let Some(request) = self.incoming_data.pop_front() {
             log::debug!("Proxying next request in queue to backend");
             match self.sql_session.backend_send_request(&request) {
                 Ok(()) => self.sql_session.recycle_request(request),
@@ -402,15 +459,15 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                     log::info!("Backend write end closed--closing frontend read end and backend");
                     if !self.frontend_read_closed {
                         self.frontend_read_closed = true;
-                        return match self.get_frontend_socket().shutdown(net::Shutdown::Read) {
-                            Ok(_) => Ok(()),
+                        match self.get_frontend_socket().shutdown(net::Shutdown::Read) {
+                            Ok(_) => (),
                             Err(e) => {
                                 return Err(io::Error::new(
                                     io::ErrorKind::ConnectionAborted,
                                     format!(
-                                    "error when attempting to close frontend socket read end: {}",
-                                    e.to_string()
-                                ),
+                                "error when attempting to close frontend socket read end: {}",
+                                e.to_string()
+                            ),
                                 ))
                             }
                         };
@@ -418,14 +475,15 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
 
                     // No sense pushing the incoming request back onto the stack--there'll be no way to send it anyways
                     // TODO: make sure the number of responses we expect from the server are correct in this edge case
-                    return Ok(());
                 }
                 Err(e) => {
                     self.incoming_data.push_front(request); // Could be a recoverable error, such as EWOULDBLOCK, so we add the request back to our queue
                     return Err(e);
                 }
             }
-        } else if self.frontend_read_closed {
+        }
+
+        if self.frontend_read_closed {
             self.backend_write_closed = true;
             match self.get_backend_socket().shutdown(net::Shutdown::Write) {
                 Ok(_) => (),
@@ -436,10 +494,10 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             }
         }
 
-        Ok(())
+        Ok(ProxyResult::none())
     }
 
-    fn process_backend_data(&mut self, validator: &mut SqlValidator<D>) -> io::Result<()> {
+    fn process_backend_data(&mut self, validator: &mut SqlValidator<D>) -> io::Result<ProxyResult> {
         // If we have no more data to receive and none to to send, we should close the connection
         if self.no_more_incoming() && self.request_queue.is_empty() && self.outgoing_data.is_empty()
         {
@@ -454,7 +512,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
 
         if self.backend_read_closed {
             log::debug!("Not reading any new responses as backend read end is closed");
-            return Ok(()); // We're not going to receive any new packets, so stop here
+            return Ok(ProxyResult::none()); // We're not going to receive any new packets, so stop here
         }
 
         // Remove any requests from the queue that are to be spoofed with error responses
@@ -469,9 +527,9 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             }
         }
 
-        if self.outgoing_data.len() >= BUFFER_SOFT_LIMIT {
+        if self.outgoing_data.len() >= RESPONSE_QUEUE_SOFT_LIMIT {
             log::debug!("Deferring reading additional responses as outgoing stream has filled its buffer allowance");
-            return Ok(()); // Defer receiving responses until the buffer has had time to be drained
+            return Ok(ProxyResult::none()); // Defer receiving responses until the buffer has had time to be drained
         }
 
         log::debug!("Reading in data from backend...");
@@ -507,7 +565,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                     };
                 }
 
-                return Ok(());
+                return Ok(ProxyResult::none());
             }
             Err(e) => return Err(e),
         };
@@ -540,10 +598,14 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
 
         log::debug!("Successfully received response data from backend");
 
-        Ok(())
+        Ok(ProxyResult {
+            frontend: IONeed::None,
+            backend: IONeed::None,
+            should_retry: true,
+        })
     }
 
-    fn proxy_data_to_frontend(&mut self) -> io::Result<()> {
+    fn proxy_data_to_frontend(&mut self) -> io::Result<ProxyResult> {
         while let Some(response) = self.outgoing_data.pop_front() {
             match self.sql_session.frontend_send_response(&response) {
                 Ok(()) => log::debug!("Successfully forwarded response to frontend"),
@@ -562,7 +624,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             }
 
             self.sql_session.recycle_response(response);
-            return Ok(());
+            return Ok(ProxyResult::none());
         }
 
         // Successfully wrote all remaining data from buffers, so connection can be closed
@@ -577,6 +639,6 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             ));
         }
 
-        Ok(())
+        Ok(ProxyResult::none())
     }
 }

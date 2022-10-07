@@ -1,7 +1,7 @@
 use crate::token::SqlToken;
 
 use super::sqli_detector;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{hash_map::Entry, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeID {
@@ -269,7 +269,9 @@ impl<D: sqli_detector::Detector> SqlMatcher<D> {
         // Consume each token and traverse tree, adding/updating nodes as needed
         for (token, _) in sql_query.into_iter() {
             let make_nonconst = match node.next.get_key_value(&token) {
-                Some((existing_token, _)) => token.is_param_token() && !token.deep_eq(existing_token),
+                Some((existing_token, _)) => {
+                    token.is_param_token() && !token.deep_eq(existing_token)
+                }
                 None => false,
             };
 
@@ -281,10 +283,8 @@ impl<D: sqli_detector::Detector> SqlMatcher<D> {
                         node.next_param_id = Some(next_node.id);
                     }
                     next_node
-                },
-                Entry::Vacant(v) => {
-                    v.insert(Node::new(self.id_counter.next()))
-                },
+                }
+                Entry::Vacant(v) => v.insert(Node::new(self.id_counter.next())),
             };
 
             fwd_nodes.push((token, node.id.clone()));
@@ -312,7 +312,7 @@ impl<D: sqli_detector::Detector> SqlMatcher<D> {
                         node.next_param_id = Some(next_node.id);
                     }
                     next_node
-                },
+                }
                 Entry::Vacant(v) => v.insert(Node::new(self.id_counter.next())),
             };
         }

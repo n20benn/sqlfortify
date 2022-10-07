@@ -1,6 +1,5 @@
 use super::token::SqlToken;
 
-
 #[allow(dead_code)]
 pub enum MultipleQueries {
     /// Any instance of multiple SQL queries in one request (i.e. semicolons) are considered malicious

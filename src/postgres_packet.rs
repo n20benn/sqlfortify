@@ -192,7 +192,7 @@ pub fn read_standard_packet_len(buffer: &[u8]) -> Result<(u8, usize), &'static s
 pub fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'static str> {
     let packet_length = read_startup_packet_len(buffer)?;
     if buffer.len() != packet_length {
-        return Err("startup packet length field mismatch (internal error)")
+        return Err("startup packet length field mismatch (internal error)");
     }
 
     let mut reader = WireReader::new(buffer);
@@ -233,7 +233,7 @@ pub fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &
 pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &'static str> {
     let (packet_identifier, packet_length) = read_standard_packet_len(buffer)?;
     if buffer.len() - 1 != packet_length {
-        return Err("request packet length field mismatch (internal error)")
+        return Err("request packet length field mismatch (internal error)");
     }
 
     let mut reader = WireReader::new(buffer);
@@ -298,7 +298,7 @@ pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, 
 pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket, &'static str> {
     let (packet_identifier, packet_length) = read_standard_packet_len(buffer)?;
     if buffer.len() - 1 != packet_length {
-        return Err("response packet length field mismatch (internal error)")
+        return Err("response packet length field mismatch (internal error)");
     }
     let mut reader = WireReader::new(buffer);
     reader.advance_up_to(5);
@@ -502,9 +502,7 @@ fn parse_copy_response_fields<'a>(
     Ok((is_binary, format_codes))
 }
 
-fn parse_auth_resp_packet<'a>(
-    mut reader: WireReader<'a>,
-) -> Result<ResponsePacket, &'static str> {
+fn parse_auth_resp_packet<'a>(mut reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
     let auth_mechanism = reader.read_int32()?;
     match auth_mechanism {
         0 | 2 | 6 | 7 | 9 => reader.finalize()?,
@@ -537,9 +535,7 @@ fn parse_auth_resp_packet<'a>(
     }
 }
 
-fn parse_bind_packet<'a>(
-    mut reader: WireReader<'a>,
-) -> Result<RequestPacket, &'static str> {
+fn parse_bind_packet<'a>(mut reader: WireReader<'a>) -> Result<RequestPacket, &'static str> {
     let dest_portal = reader.read_utf8_c_str()?;
     let prepared_stmt = reader.read_utf8_c_str()?;
     let format_codes_cnt = reader.read_int16_length()?;
