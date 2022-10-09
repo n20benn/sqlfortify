@@ -1,0 +1,21 @@
+# This is an example of a configuration that sets every possible option for SQLFortify
+
+
+
+# TODO: should they be called 'proxies'? What about the times when it's used as 'plugins'? Maybe 'instances' might be more apt a description
+
+
+[proxy]
+# General rules that apply to all running proxies below 
+# These rules are _superceded_ by specific rules in each proxy
+
+
+[proxy.mysql3354]
+db_type = "mysql"
+listen = "127.0.0.1"
+port = 3354 # Someday we will support UNIX sockets and named pipes...
+
+[proxy.postgres5432]
+db_type = "postgresql"
+listen = "0.0.0.0"
+port = 5432

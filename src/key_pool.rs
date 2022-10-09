@@ -1,14 +1,15 @@
+use nohash_hasher;
 use std::collections::HashSet;
 
 pub struct KeyPool {
-    available_keys: HashSet<usize>,
+    available_keys: HashSet<usize, nohash_hasher::BuildNoHashHasher<usize>>,
     next_key: usize,
 }
 
 impl KeyPool {
     pub fn new() -> Self {
         KeyPool {
-            available_keys: HashSet::new(),
+            available_keys: HashSet::with_hasher(nohash_hasher::BuildNoHashHasher::default()),
             next_key: 0,
         }
     }

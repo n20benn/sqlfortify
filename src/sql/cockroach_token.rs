@@ -1,6 +1,6 @@
-use super::token::*;
+use crate::sql::*;
 use phf::phf_map;
-use std::fmt::{Display, Write};
+use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
 // Derived from https://www.cockroachlabs.com/docs/stable/sql-grammar.html
@@ -14,6 +14,7 @@ pub enum CockroachToken {
     UnknownToken(char),
     Identifier(String), // must: begin with underscore?; subsequent alphanumeric, underscores, or dollar signs. Double-quotes bypass these rules and preserves case sensitivity. Examples include asdf and "asdf", as well as $asdf
     SingleQuote,
+    DoubleQuote,
     DollarQuote(String),
     Const(String),
     Placeholder(String), // looks like $1, must be betweeen 1 and 65536 (we don't enforce)
@@ -22,6 +23,7 @@ pub enum CockroachToken {
     LineComment,
     BlockCommentOpen,
     BlockCommentClose,
+    Comment(String),
     Whitespace(char),
 }
 
@@ -1265,6 +1267,10 @@ impl PartialEq for CockroachToken {
                 CockroachToken::SingleQuote => true,
                 _ => false,
             },
+            CockroachToken::DoubleQuote => match other {
+                CockroachToken::DoubleQuote => true,
+                _ => false,
+            },
             CockroachToken::DollarQuote(id1) => match other {
                 CockroachToken::DollarQuote(id2) => id1 == id2,
                 _ => false,
@@ -1287,6 +1293,10 @@ impl PartialEq for CockroachToken {
             },
             CockroachToken::BlockCommentClose => match other {
                 CockroachToken::BlockCommentClose => true,
+                _ => false,
+            },
+            CockroachToken::Comment(s1) => match other {
+                CockroachToken::Comment(s2) => s1 == s2,
                 _ => false,
             },
             CockroachToken::Symbol(c1) => match other {
@@ -1336,20 +1346,27 @@ impl Hash for CockroachToken {
             CockroachToken::BlockCommentClose => {
                 state.write_u8(8);
             }
-            CockroachToken::Placeholder(s) => {
+            CockroachToken::Comment(s) => {
                 state.write_u8(9);
                 s.hash(state);
             }
-            CockroachToken::Keyword(k) => {
+            CockroachToken::Placeholder(s) => {
                 state.write_u8(10);
+                s.hash(state);
+            }
+            CockroachToken::Keyword(k) => {
+                state.write_u8(11);
                 k.hash(state);
             }
             CockroachToken::Symbol(s) => {
-                state.write_u8(11);
+                state.write_u8(12);
                 s.hash(state);
             }
             CockroachToken::LineComment => {
-                state.write_u8(12);
+                state.write_u8(13);
+            }
+            CockroachToken::DoubleQuote => {
+                state.write_u8(14);
             }
         };
     }
@@ -1363,18 +1380,20 @@ impl Display for CockroachToken {
             | CockroachToken::Symbol(c) => write!(f, "{}", c),
             CockroachToken::Identifier(s) => write!(f, "{}", s),
             CockroachToken::SingleQuote => write!(f, "'"),
+            CockroachToken::DoubleQuote => write!(f, "\""),
             CockroachToken::DollarQuote(id) => write!(f, "${}$", id),
             CockroachToken::Const(s) => write!(f, "{}", s),
             CockroachToken::Placeholder(s) => write!(f, "{}", s),
             CockroachToken::LineComment => write!(f, "--"),
             CockroachToken::BlockCommentOpen => write!(f, "/*"),
             CockroachToken::BlockCommentClose => write!(f, "*/"),
+            CockroachToken::Comment(s) => write!(f, "{}", s),
             CockroachToken::Keyword(k) => write!(f, "{}", k),
         }
     }
 }
 
-impl SqlToken for CockroachToken {
+impl Token for CockroachToken {
     fn scan_forward(query: &str) -> Vec<(Self, usize)> {
         Self::scan_with_parameters(query, ScanDirection::Forward)
     }
@@ -1428,13 +1447,7 @@ impl CockroachToken {
                     CockroachToken::BlockCommentClose
                 }
                 ('\'', _) => CockroachToken::SingleQuote,
-                ('"', _) => match_identifier_quot(&mut iter),
-                /*
-                (prefix @ ('b' | 'B' | 'x'), Some('\'')) => {
-                    iter.next(); // consume '\''
-                    CockroachToken::SingleQuote(Some(prefix))
-                }
-                */
+                ('"', _) => CockroachToken::DoubleQuote,
                 ('.', Some('0'..='9')) => match_fconst_period(&mut iter, vec!['.']),
                 ('$', Some('0'..='9')) => match_placeholder(&mut iter),
                 ('$', Some(_)) => match_dollar_opening(&mut iter),
@@ -1463,140 +1476,120 @@ impl CockroachToken {
 
     /// Takes any instances of quoted parameters (such as apostraphe-quoted, like 'param', or dollar-quoted, like $$param$$ or $label$param$label$) and condenses their contents into a single 'Const' token.
     ///
-    /// This function does not condense quoted parameters contained within block comments or nested quoted parameters, though it does condense quoted parameters that come after a line comment.
-    /// As such, it takes into account all nesting rules related to comments and parameters in PostgreSQL.
+    /// This function also condenses block comments and line comments.
+    /// It takes into account all nesting rules related to comments and parameters in PostgreSQL.
     fn scan_with_parameters(query: &str, direction: ScanDirection) -> Vec<(Self, usize)> {
+        // First, scan tokens without accounting for any quoted or commented-out portions
         let mut tokens = CockroachToken::scan_without_parameters(query);
-        let mut norm_tokens = Vec::new();
-        let mut layers = Vec::new();
-        let mut next_parameter: Option<String> = None;
-
-        if direction == ScanDirection::Reverse {
-            tokens.reverse()
+        if tokens.len() == 0 {
+            return Vec::new();
         }
 
-        let num_tokens = tokens.len();
+        let mut norm_tokens = Vec::new();
+        let mut layers = Vec::new();
+        let mut contents: Option<String> = None;
+        let (indices, last_idx) = if direction == ScanDirection::Forward {
+            (0..=(tokens.len() - 1), tokens.len() - 1)
+        } else {
+            tokens.reverse();
+            ((tokens.len() - 1)..=0, 0)
+        };
 
-        for (i, next_token) in tokens.into_iter().enumerate() {
-            let idx = match direction {
-                ScanDirection::Forward => i,
-                ScanDirection::Reverse => (num_tokens - 1) - i,
-            };
-
-            match (layers.first(), layers.last()) {
-                (Some(CockroachToken::BlockCommentOpen), _) => {
-                    // BlockCommentOpen can only be on layers stack if direction == Forward
-                    match next_token {
-                        CockroachToken::BlockCommentOpen => layers.push(next_token.clone()),
-                        CockroachToken::BlockCommentClose => {
-                            layers.pop();
-                        }
-                        _ => (),
-                    }
-                    norm_tokens.push((next_token, idx));
-                }
-                (Some(CockroachToken::BlockCommentClose), _) => {
-                    // BlockCommentClose can only be on layers stack if direction == Reverse
-                    match next_token {
-                        CockroachToken::BlockCommentClose => layers.push(next_token.clone()),
-                        CockroachToken::BlockCommentOpen => {
-                            layers.pop();
-                        }
-                        _ => (),
-                    }
-                    norm_tokens.push((next_token, idx));
-                }
-                (_, Some(last)) => {
-                    if next_token.deep_eq(last) {
+        let mut iter = indices.zip(tokens.into_iter()).peekable();
+        while let Some((idx, next_token)) = iter.next() {
+            if let Some(top_layer) = layers.last() {
+                match (top_layer, &next_token) {
+                    (CockroachToken::BlockCommentOpen, CockroachToken::BlockCommentClose)
+                    | (CockroachToken::BlockCommentClose, CockroachToken::BlockCommentOpen)
+                    | (CockroachToken::SingleQuote, CockroachToken::SingleQuote) => {
                         layers.pop();
-                    } else if let CockroachToken::SingleQuote | CockroachToken::DollarQuote(_) =
-                        next_token
-                    {
-                        layers.push(next_token.clone())
-                    } else if direction == ScanDirection::Forward
-                        && next_token == CockroachToken::BlockCommentOpen
-                    {
-                        layers.push(next_token.clone())
-                    } else if direction == ScanDirection::Reverse
-                        && next_token == CockroachToken::BlockCommentClose
-                    {
-                        layers.push(next_token.clone())
                     }
-
-                    if !layers.is_empty() {
-                        match next_parameter.as_mut() {
-                            Some(param) => {
-                                write!(param, "{}", next_token).unwrap(); // Will not panic! on unwrap: https://github.com/rust-lang/rust/blob/1.47.0/library/alloc/src/string.rs#L2414-L2427
+                    (CockroachToken::DoubleQuote, CockroachToken::DoubleQuote) => {
+                        if let Some((_, CockroachToken::DoubleQuote)) = iter.peek() {
+                            iter.next();
+                            match contents.as_mut() {
+                                Some(param) => param.push_str("\""),
+                                None => contents = Some("\"".to_string()),
                             }
-                            None => next_parameter = Some(next_token.to_string()),
                         }
-                    } else {
-                        let const_idx = match direction {
+                        layers.pop();
+                    }
+                    (CockroachToken::DollarQuote(d1), CockroachToken::DollarQuote(d2))
+                        if d1 == d2 =>
+                    {
+                        layers.pop();
+                    }
+                    (CockroachToken::DollarQuote(_), CockroachToken::DollarQuote(_)) => {
+                        layers.push(next_token.clone())
+                    } // Dollar quoting can be nested
+                    (CockroachToken::BlockCommentOpen, CockroachToken::BlockCommentOpen)
+                    | (CockroachToken::BlockCommentClose, CockroachToken::BlockCommentClose) => {
+                        layers.push(next_token.clone())
+                    } // Block comments can also be nested
+                    _ => (),
+                }
+
+                if layers.is_empty() {
+                    norm_tokens.push((
+                        match &next_token {
+                            CockroachToken::BlockCommentOpen
+                            | CockroachToken::BlockCommentClose => {
+                                CockroachToken::Comment(contents.unwrap_or(String::new()))
+                            }
+                            _ => CockroachToken::Const(contents.unwrap_or(String::new())),
+                        },
+                        match direction {
                             ScanDirection::Forward => idx - 1,
                             ScanDirection::Reverse => idx + 1,
-                        };
-                        norm_tokens.push((
-                            CockroachToken::Const(next_parameter.unwrap_or(String::new())),
-                            const_idx,
-                        ));
-                        norm_tokens.push((next_token, idx));
-                        next_parameter = None;
-                    }
-                }
-                (_, None) => {
-                    if let CockroachToken::SingleQuote | CockroachToken::DollarQuote(_) = next_token
-                    {
-                        layers.push(next_token.clone());
-                    } else if direction == ScanDirection::Forward
-                        && next_token == CockroachToken::BlockCommentOpen
-                    {
-                        layers.push(next_token.clone())
-                    } else if direction == ScanDirection::Reverse
-                        && next_token == CockroachToken::BlockCommentClose
-                    {
-                        layers.push(next_token.clone())
-                    }
+                        },
+                    ));
                     norm_tokens.push((next_token, idx));
+                    contents = None;
+                } else {
+                    match contents.as_mut() {
+                        Some(param) => param.push_str(next_token.to_string().as_str()),
+                        None => contents = Some(next_token.to_string()),
+                    }
                 }
+            } else {
+                match &next_token {
+                    CockroachToken::SingleQuote
+                    | CockroachToken::DollarQuote(_)
+                    | CockroachToken::DoubleQuote
+                    | CockroachToken::LineComment => layers.push(next_token.clone()),
+                    CockroachToken::BlockCommentOpen if direction == ScanDirection::Forward => {
+                        layers.push(next_token.clone())
+                    }
+                    CockroachToken::BlockCommentClose if direction == ScanDirection::Reverse => {
+                        layers.push(next_token.clone())
+                    }
+                    _ => (),
+                }
+                norm_tokens.push((next_token, idx));
             }
         }
 
-        if let Some(CockroachToken::SingleQuote | CockroachToken::DollarQuote(_)) = layers.first() {
-            let final_idx = match direction {
-                ScanDirection::Forward => num_tokens - 1,
-                ScanDirection::Reverse => 0,
-            };
-            norm_tokens.push((
-                CockroachToken::Const(next_parameter.unwrap_or(String::new())),
-                final_idx,
-            ));
+        // If there was no closing quote or comment, or if there was a line comment, then just output the Const/Identifier/Comment anyway
+        match layers.first() {
+            Some(CockroachToken::SingleQuote | CockroachToken::DollarQuote(_)) => {
+                norm_tokens.push((
+                    CockroachToken::Const(contents.unwrap_or(String::new())),
+                    last_idx,
+                ))
+            }
+            Some(CockroachToken::DoubleQuote) => norm_tokens.push((
+                CockroachToken::Identifier(contents.unwrap_or(String::new())),
+                last_idx,
+            )),
+            Some(_) => norm_tokens.push((
+                CockroachToken::Comment(contents.unwrap_or(String::new())),
+                last_idx,
+            )),
+            None => (),
         }
 
         norm_tokens
     }
-}
-
-fn match_identifier_quot(iter: &mut std::iter::Peekable<std::str::Chars>) -> CockroachToken {
-    let mut chars = vec![];
-
-    while let (Some(c), p) = (iter.next(), iter.peek()) {
-        match (c, p) {
-            ('"', Some('"')) => {
-                // TODO: does '\\"' count here as well?
-                chars.push(c);
-                chars.push('"');
-                iter.next();
-            }
-            ('"', _) => {
-                return CockroachToken::Identifier(chars.into_iter().collect::<String>());
-            }
-            _ => {
-                chars.push(c);
-            }
-        };
-    }
-
-    CockroachToken::Const(chars.into_iter().collect::<String>()) // TODO: should we even be taking out information in between double quotes??
 }
 
 fn match_kw_id(

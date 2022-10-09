@@ -1,8 +1,14 @@
+pub mod mysql_session;
+pub mod postgres_session;
+
+mod postgres_packet;
+mod wire_reader;
+
 use std::io;
 
 // Requests and responses have a 1-to-1 mapping
 
-pub struct MessageInfo {
+pub struct PacketInfo {
     /// If set, indicates that the given username should be used for subsequent SQL queries.
     pub username: Option<String>,
     /// If set, indicates that the given database should be used for subsequent SQL queries.
@@ -21,10 +27,10 @@ pub struct MessageInfo {
     pub unsupported_version: bool,
 }
 
-impl MessageInfo {
+impl PacketInfo {
     /// Creates a default message that does not convey any significant information to the upper layer.
     pub fn new() -> Self {
-        MessageInfo {
+        PacketInfo {
             username: None,
             database: None,
             query: None,
@@ -37,27 +43,25 @@ impl MessageInfo {
     }
 }
 
-pub trait ClientMessage {
-    fn get_basic_info<'a>(&'a self) -> &'a MessageInfo;
-    //    fn get_basic_type<'a>(&'a self) -> &'a ClientMessageType;
+pub trait ClientPacket {
+    fn get_basic_info<'a>(&'a self) -> &'a PacketInfo;
 
     fn as_slice<'a>(&'a self) -> &'a [u8];
 
     fn is_valid(&self) -> bool;
 }
 
-pub trait ServerMessage {
-    fn get_basic_info<'a>(&'a self) -> &'a MessageInfo;
-    //    fn get_basic_type<'a>(&'a self) -> &'a ServerMessageType;
+pub trait ServerPacket {
+    fn get_basic_info<'a>(&'a self) -> &'a PacketInfo;
 
     fn as_slice<'a>(&'a self) -> &'a [u8];
 
     fn is_valid(&self) -> bool;
 }
 
-pub trait ClientSession<T: io::Read + io::Write> {
-    type RequestType: ClientMessage;
-    type ResponseType: ServerMessage;
+pub trait Client<T: io::Read + io::Write> {
+    type RequestType: ClientPacket;
+    type ResponseType: ServerPacket;
 
     fn new(io: T) -> Self;
 
@@ -71,9 +75,9 @@ pub trait ClientSession<T: io::Read + io::Write> {
     fn get_io_ref(&self) -> &T;
 }
 
-pub trait ServerSession<T: io::Read + io::Write> {
-    type RequestType: ClientMessage;
-    type ResponseType: ServerMessage;
+pub trait Server<T: io::Read + io::Write> {
+    type RequestType: ClientPacket;
+    type ResponseType: ServerPacket;
 
     fn new(io: T) -> Self;
 
@@ -87,9 +91,9 @@ pub trait ServerSession<T: io::Read + io::Write> {
     fn get_io_ref(&self) -> &T;
 }
 
-pub trait ProxySession<C: io::Read + io::Write, S: io::Read + io::Write> {
-    type RequestType: ClientMessage;
-    type ResponseType: ServerMessage;
+pub trait Proxy<C: io::Read + io::Write, S: io::Read + io::Write> {
+    type RequestType: ClientPacket;
+    type ResponseType: ServerPacket;
 
     fn new(backend_io: C, frontend_io: S) -> Self;
 

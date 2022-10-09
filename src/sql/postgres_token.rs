@@ -1,5 +1,5 @@
-use super::token::SqlToken;
-use phf::{phf_map, Map};
+use crate::sql;
+use phf::phf_map;
 
 // Currently just a clone of CockroachToken
 
@@ -1208,7 +1208,7 @@ impl PartialEq for PostgresToken {
 
 impl Eq for PostgresToken {}
 
-impl SqlToken for PostgresToken {
+impl sql::Token for PostgresToken {
     fn deep_eq(&self, other: &Self) -> bool {
         (self == other)
             && match self {
@@ -1239,7 +1239,7 @@ impl SqlToken for PostgresToken {
         }
     }
 
-    fn scan_from(query: &str) -> Vec<Self> {
+    fn scan_forward(query: &str) -> Vec<Self> {
         let mut tokens = vec![];
         let mut chars: Vec<char> = vec![];
         let mut iter = query.chars().peekable();
@@ -1277,11 +1277,11 @@ impl SqlToken for PostgresToken {
                 ('$', None) => PostgresToken::UnknownToken(c),
                 ('_', _) => match_kw_id(&mut iter, vec!['_']),
                 (
-                    ('/' | '-' | '^' | ';' | '(' | ')' | '@' | ',' | '=' | '*' | '+' | '~' | '%'
-                    | '#' | '&' | '|' | '<' | '>' | '?' | '[' | ']' | '{' | '}' | ':' | '.'),
+                    '/' | '-' | '^' | ';' | '(' | ')' | '@' | ',' | '=' | '*' | '+' | '~' | '%'
+                    | '#' | '&' | '|' | '<' | '>' | '?' | '[' | ']' | '{' | '}' | ':' | '.',
                     _,
                 ) => PostgresToken::Symbol(c),
-                ((' ' | '\t' | '\r' | '\n'), _) => PostgresToken::Whitespace(c),
+                (' ' | '\t' | '\r' | '\n', _) => PostgresToken::Whitespace(c),
                 ('0', Some('x')) => {
                     iter.next();
                     match_iconst_0x(&mut iter)
@@ -1301,64 +1301,6 @@ impl SqlToken for PostgresToken {
 
         tokens
     }
-
-    // Currently covers:
-    // - Injected semicolons
-    // - Injected comments
-    fn is_malicious_query(pattern: &Vec<Self>) -> bool {
-        let mut iter = pattern.iter();
-        while let Some(token) = iter.next() {
-            match token {
-                PostgresToken::Symbol(';') | PostgresToken::LineComment(_) => return true,
-                PostgresToken::Identifier(i) => {
-                    // Block metadata tables here
-                    // Block file/socket/exec functions here?
-                }
-                PostgresToken::Keyword(Keyword::Union) => {
-                    // TODO: is this already covered by blocking metadata tables?
-                }
-                PostgresToken::Keyword(Keyword::Or) => {
-                    if is_tautology(iter.clone()) {
-                        return true;
-                    }
-                }
-                /*
-                PostgresToken::Keyword(Keyword::And) => {
-                    // Call function here that checks for negative tautology immediately following 'AND'?
-                },
-                */
-                _ => (),
-            }
-        }
-
-        match pattern.last() {
-            Some(PostgresToken::BlockComment(_)) => true, // Or should we just reject block comments anywhere?
-            _ => false,
-        }
-    }
-}
-
-fn is_tautology(mut iter: std::slice::Iter<PostgresToken>) -> bool {
-    // Watch out for precedence of OR/AND operators (among other operators and operations) here
-
-    // We *could* make a fully-fledged parser that checks whether a
-    // given mathematical operation will always be true here... (halting probs)
-    // OR we could just see if any tables/column values are used. It is unlikely
-    // (though far from impossible) that a programmer would use a hardcoded tautology
-    // such as `... WHERE <user_input_value> = 42`, and it becomes more unlikely
-    // when we only check for tautologies immediately following 'OR' and its variants.
-
-    for token in iter {
-        match token {
-            //PostgresToken::Keyword(Keyword::And) | PostgresToken::Keyword(Keyword::)
-            PostgresToken::Identifier(_) | PostgresToken::Keyword(_) => {
-                // a_expr in CockroachDB
-            }
-            _ => {}
-        };
-    }
-
-    false
 }
 
 fn read_until(iter: &mut std::iter::Peekable<std::str::Chars>, c: char) -> String {

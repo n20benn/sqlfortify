@@ -1,6 +1,5 @@
 use super::cockroach_token::*;
-use super::sqli_detector::*;
-use crate::{sqli_detector::MultipleQueries, token::SqlToken};
+use crate::sql::*;
 
 pub struct CockroachDetector {}
 
@@ -12,7 +11,7 @@ impl Detector for CockroachDetector {
         I: std::iter::DoubleEndedIterator<Item = &'a CockroachToken> + Clone,
     >(
         mut query_iter: I,
-        params: &crate::sqli_detector::Parameters,
+        params: &Parameters,
     ) -> bool
     where
         Self: 'a,

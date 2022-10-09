@@ -3,7 +3,7 @@ use std::{cmp, io};
 
 use super::postgres_packet::*;
 
-use super::sql_session::*;
+use crate::sql_wire::*;
 
 // Minimum number of bytes needed to extract 'length' field from packet
 const STARTUP_PKT_HDRLEN: usize = 4;
@@ -32,7 +32,7 @@ enum SessionState {
 }
 
 pub struct PostgresRequest {
-    basic_info: MessageInfo,
+    basic_info: PacketInfo,
     is_valid: bool,
     data: Vec<u8>,
     pkt_len: usize,
@@ -41,7 +41,7 @@ pub struct PostgresRequest {
 impl PostgresRequest {
     fn new() -> Self {
         PostgresRequest {
-            basic_info: MessageInfo::new(),
+            basic_info: PacketInfo::new(),
             is_valid: false,
             data: Vec::from([0; DEFAULT_REQ_RESP_BUFLEN]),
             pkt_len: 0,
@@ -49,8 +49,8 @@ impl PostgresRequest {
     }
 }
 
-impl ClientMessage for PostgresRequest {
-    fn get_basic_info<'a>(&'a self) -> &'a MessageInfo {
+impl ClientPacket for PostgresRequest {
+    fn get_basic_info<'a>(&'a self) -> &'a PacketInfo {
         &self.basic_info // TODO: stub
     }
 
@@ -64,7 +64,7 @@ impl ClientMessage for PostgresRequest {
 }
 
 pub struct PostgresResponse {
-    basic_info: MessageInfo,
+    basic_info: PacketInfo,
     is_valid: bool,
     raw_data: Vec<u8>,
     pkt_len: usize,
@@ -73,7 +73,7 @@ pub struct PostgresResponse {
 impl PostgresResponse {
     fn new() -> Self {
         PostgresResponse {
-            basic_info: MessageInfo::new(),
+            basic_info: PacketInfo::new(),
             is_valid: false,
             raw_data: Vec::from([0; DEFAULT_REQ_RESP_BUFLEN]), // TODO: is this inefficient? is there a better way?
             pkt_len: 0,
@@ -81,8 +81,8 @@ impl PostgresResponse {
     }
 }
 
-impl ServerMessage for PostgresResponse {
-    fn get_basic_info<'a>(&'a self) -> &'a MessageInfo {
+impl ServerPacket for PostgresResponse {
+    fn get_basic_info<'a>(&'a self) -> &'a PacketInfo {
         &self.basic_info // TODO: stub
     }
 
@@ -103,7 +103,7 @@ pub struct PostgresClientSession<T: io::Read + io::Write> {
     request_part_idx: Option<usize>,
 }
 
-impl<T: io::Read + io::Write> ClientSession<T> for PostgresClientSession<T> {
+impl<T: io::Read + io::Write> Client<T> for PostgresClientSession<T> {
     type RequestType = PostgresRequest;
     type ResponseType = PostgresResponse;
 
@@ -165,7 +165,7 @@ pub struct PostgresServerSession<T: io::Read + io::Write> {
     state: SessionState,
 }
 
-impl<T: io::Read + io::Write> ServerSession<T> for PostgresServerSession<T> {
+impl<T: io::Read + io::Write> Server<T> for PostgresServerSession<T> {
     type RequestType = PostgresRequest;
     type ResponseType = PostgresResponse;
 
@@ -224,9 +224,7 @@ pub struct PostgresProxySession<C: io::Read + io::Write, S: io::Read + io::Write
     state: SessionState,
 }
 
-impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
-    for PostgresProxySession<C, S>
-{
+impl<C: io::Read + io::Write, S: io::Read + io::Write> Proxy<C, S> for PostgresProxySession<C, S> {
     type RequestType = PostgresRequest;
     type ResponseType = PostgresResponse;
 
@@ -323,7 +321,7 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
 
     /// Safely reuses the allocated structures and buffers of the given request, thereby resulting in fewer repeated allocations of large buffers
     fn recycle_request(&mut self, mut request: Self::RequestType) {
-        request.basic_info = MessageInfo::new();
+        request.basic_info = PacketInfo::new();
         request.pkt_len = 0;
         request.is_valid = false;
         self.recycled_requests.push_back(request);
@@ -331,7 +329,7 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
 
     /// Safely reuses the allocated structures and buffers of the given response, thereby resulting in fewer repeated allocations of large buffers
     fn recycle_response(&mut self, mut response: Self::ResponseType) {
-        response.basic_info = MessageInfo::new();
+        response.basic_info = PacketInfo::new();
         response.pkt_len = 0;
         response.is_valid = false;
         self.recycled_responses.push_back(response);
@@ -357,7 +355,7 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
         }
 
         Some(PostgresResponse {
-            basic_info: MessageInfo::new(),
+            basic_info: PacketInfo::new(),
             is_valid: true,
             raw_data: Vec::from([b'N']),
             pkt_len: SSL_RESPONSE_PKT_HDRLEN,
@@ -383,7 +381,7 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
         }
 
         Some(PostgresResponse {
-            basic_info: MessageInfo::new(),
+            basic_info: PacketInfo::new(),
             is_valid: true,
             raw_data: Vec::from([b'N']),
             pkt_len: 1,
@@ -398,7 +396,7 @@ impl<C: io::Read + io::Write, S: io::Read + io::Write> ProxySession<C, S>
     }
 
     fn error_response(&mut self) -> Self::ResponseType {
-        let mut basic_info = MessageInfo::new();
+        let mut basic_info = PacketInfo::new();
         basic_info.result = Some(false);
 
         PostgresResponse {
@@ -414,22 +412,22 @@ fn read_packet<'a, T: io::Read>(
     io: &mut T,
     buf: &'a mut Vec<u8>,
     buf_len: &mut usize, // 0 <= buf_len <= buf.len()
-    pkt_len: usize, // Could be *anything*--passed in from client
+    pkt_len: usize,      // Could be *anything*--passed in from client
 ) -> io::Result<&'a mut [u8]> {
     let mut buffer_length = buf.len();
     let mut truncated_end_idx = cmp::min(pkt_len, buffer_length);
 
     if *buf_len > buf.len() {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput, 
-            "Internal error while reading in packet--write index exceeded buffer length"    
-        ))
+            io::ErrorKind::InvalidInput,
+            "Internal error while reading in packet--write index exceeded buffer length",
+        ));
     } // Thus, *buf_len <= buf.len()
 
     loop {
         while let Some(remaining_buffer) = buf.get_mut(*buf_len..truncated_end_idx) {
             if remaining_buffer.len() == 0 {
-                break
+                break;
             }
 
             match io.read(remaining_buffer) {
@@ -448,7 +446,7 @@ fn read_packet<'a, T: io::Read>(
         }
 
         if *buf_len >= pkt_len {
-            break
+            break;
         } else {
             log::debug!("Packet contents exceeded available space--increasing buffer size");
             buf.extend(std::iter::repeat(0).take(cmp::min(buffer_length, pkt_len - buffer_length))); // We need more buffer--at most double the current one
@@ -458,7 +456,7 @@ fn read_packet<'a, T: io::Read>(
         }
     }
 
-    return Ok(&mut buf[..pkt_len]) // Invariant: pkt_len <= *buf_len <= buf.len(), so this will never index out of bounds
+    return Ok(&mut buf[..pkt_len]); // Invariant: pkt_len <= *buf_len <= buf.len(), so this will never index out of bounds
 }
 
 fn receive_request<T: io::Read>(
@@ -484,12 +482,7 @@ fn receive_request<T: io::Read>(
             };
 
             log::debug!("Reading startup request body...");
-            let pkt = read_packet(
-                io,
-                &mut request.data,
-                &mut request.pkt_len,
-                pkt_len,
-            )?;
+            let pkt = read_packet(io, &mut request.data, &mut request.pkt_len, pkt_len)?;
 
             log::debug!("Request body read.");
             request.is_valid = true;
@@ -539,12 +532,7 @@ fn receive_request<T: io::Read>(
             };
 
             log::debug!("Reading request body...");
-            let pkt = read_packet(
-                io,
-                &mut request.data,
-                &mut request.pkt_len,
-                pkt_len,
-            )?;
+            let pkt = read_packet(io, &mut request.data, &mut request.pkt_len, pkt_len)?;
             request.is_valid = true;
             log::debug!("Request body read.");
 
@@ -600,12 +588,7 @@ fn receive_response<T: io::Read>(
     };
 
     log::debug!("Reading response body...");
-    let pkt = read_packet(
-        io,
-        &mut response.raw_data,
-        &mut response.pkt_len,
-        pkt_len,
-    )?;
+    let pkt = read_packet(io, &mut response.raw_data, &mut response.pkt_len, pkt_len)?;
     response.is_valid = true;
 
     log::debug!("Response body read.");
@@ -641,7 +624,7 @@ fn receive_response<T: io::Read>(
 fn advance_up_to<'a, T>(buf: &'a [T], amount: usize) -> &'a [T] {
     match buf.get(amount..) {
         Some(b) => b,
-        None => &mut []
+        None => &mut [],
     }
 }
 
@@ -671,12 +654,14 @@ fn send_request<T: io::Write>(
 
     while buf.len() > 0 {
         let num_written = match io.write(buf) {
-            Ok(0) => return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "I/O device unexpectedly closed while writing data"
-            )),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "I/O device unexpectedly closed while writing data",
+                ))
+            }
             Ok(num_written) => num_written,
-            Err(e) => return Err(e)
+            Err(e) => return Err(e),
         };
 
         total_written += num_written;
@@ -704,20 +689,24 @@ fn send_response<T: io::Write>(
 
     let mut buf = match response.as_slice().get(total_written..response.pkt_len) {
         Some(buf) => buf,
-        None => return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unexpected response packet sent out of order (invalid length)",
-        ))
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response packet sent out of order (invalid length)",
+            ))
+        }
     };
 
     while buf.len() > 0 {
         let num_written = match io.write(buf) {
-            Ok(0) => return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "I/O device unexpectedly closed while writing data"
-            )),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "I/O device unexpectedly closed while writing data",
+                ))
+            }
             Ok(num_written) => num_written,
-            Err(e) => return Err(e)
+            Err(e) => return Err(e),
         };
 
         total_written += num_written;

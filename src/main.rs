@@ -1,30 +1,18 @@
+mod connection;
 mod event_handler;
 mod key_pool;
 mod matcher;
-mod proxy;
 mod validator;
-mod wire_reader;
 
-// Code specific to scanning in packets from the wire
-mod postgres_packet;
+mod sql;
+mod sql_wire;
 
-// Code specific to sending requests/responses
-mod sql_session;
-mod mysql_session;
-mod postgres_session;
-
-mod token;
-mod cockroach_token;
-
-mod sqli_detector;
-mod cockroach_detector;
-
-
-use cockroach_detector::CockroachDetector;
 use socket2::{SockAddr, Socket};
-use std::net::SocketAddr;
+use sql::cockroach_detector::CockroachDetector;
+use std::{fs, io::Read, net::SocketAddr, path};
+//use toml::{self, Deserializer};
 
-use postgres_session::PostgresProxySession;
+use sql_wire::postgres_session::PostgresProxySession;
 
 #[macro_use]
 extern crate enum_display_derive;
@@ -68,6 +56,30 @@ fn main() {
         error!("Forcing process termination with exit code 1");
         process::exit(1); // Important part--kills all threads if any one dies
     }));
+    */
+
+    /*
+    let config_path = path::Path::new("/home/nathaniel/Code/sqlfortify/default_config.toml");
+    let mut file = match fs::File::open(&config_path) {
+        Ok(file) => file,
+        Err(e) => panic!(
+            "Couldn't open configuration file {}: {}",
+            config_path.display(),
+            e
+        ),
+    };
+
+    let mut config = String::new();
+    match file.read_to_string(&mut config) {
+        Ok(_) => (),
+        Err(e) => panic!(
+            "Configuration file located at {} had malformed data: {}",
+            config_path.display(),
+            e
+        ),
+    }
+
+    let mut des = Deserializer::new(config.as_str());
     */
 
     /*

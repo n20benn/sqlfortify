@@ -1,9 +1,9 @@
-use crate::sqli_detector;
+use crate::sql;
 
-use super::sql_session::{ClientMessage, ProxySession, ServerMessage};
+use crate::sql_wire;
+use crate::sql_wire::{ClientPacket, ServerPacket};
 use socket2::{SockAddr, Socket};
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 use std::{io, net, ops};
 
 use super::validator::SqlValidator;
@@ -101,7 +101,7 @@ impl ops::BitOrAssign for ProxyResult {
 /// Handles and proxies a single SQL connection between an incoming client connection
 /// and the backend database.
 ///
-pub struct Proxy<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> {
+pub struct Connection<D: sql::Detector, P: sql_wire::Proxy<Socket, Socket>> {
     backend_address: SockAddr,
     backend_key: usize,
     backend_read_closed: bool,
@@ -115,7 +115,7 @@ pub struct Proxy<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> {
     sql_session: P,
     /// The current connectivity state of the proxy
     state: ConnectionState,
-    _sqli_detector_type: PhantomData<D>,
+    _sqli_detector_type: std::marker::PhantomData<D>,
 }
 
 // STEPS TO REMOVE INDIVIDUAL PACKETS:
@@ -127,7 +127,7 @@ pub struct Proxy<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> {
 // 4. Once the packet to remove is reached, use the `advance_read()` function in the Buffer to completely remove the packet
 // 5. Go back to write_raw() after done for efficiency
 
-impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
+impl<D: sql::Detector, P: sql_wire::Proxy<Socket, Socket>> Connection<D, P> {
     pub fn new(
         backend_address: SockAddr,
         backend_key: usize,
@@ -136,7 +136,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         frontend_key: usize,
         frontend_socket: Socket,
     ) -> Self {
-        Proxy {
+        Connection {
             backend_address,
             backend_key,
             backend_read_closed: false,
@@ -149,7 +149,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             request_queue: VecDeque::new(),
             sql_session: P::new(backend_socket, frontend_socket),
             state: ConnectionState::DatabaseTCPHandshake,
-            _sqli_detector_type: PhantomData {},
+            _sqli_detector_type: std::marker::PhantomData {},
         }
     }
 
@@ -365,7 +365,10 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         let mut request = match self.sql_session.frontend_receive_request() {
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                log::info!("Frontend read closed--no more new incoming packets for {}", self.frontend_address.as_str());
+                log::info!(
+                    "Frontend read closed--no more new incoming packets for {}",
+                    self.frontend_address.as_str()
+                );
                 self.frontend_read_closed = true;
                 return Ok(ProxyResult::none());
             }
@@ -406,7 +409,10 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         }
 
         if let Some(query) = request.get_basic_info().query.as_ref() {
-            log::info!("SQL query received from frontend for {}--checking for SQL injection attempts...", self.frontend_address.as_str());
+            log::info!(
+                "SQL query received from frontend for {}--checking for SQL injection attempts...",
+                self.frontend_address.as_str()
+            );
             match validator.check_query(query.as_str()) {
                 Err(e) => {
                     log::warn!("SQL injection detected in query: {}", e);
@@ -453,7 +459,10 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             match self.sql_session.backend_send_request(&request) {
                 Ok(()) => self.sql_session.recycle_request(request),
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                    log::info!("Backend write end closed--closing frontend read end and backend for {}", self.frontend_address.as_str());
+                    log::info!(
+                        "Backend write end closed--closing frontend read end and backend for {}",
+                        self.frontend_address.as_str()
+                    );
                     if !self.frontend_read_closed {
                         self.frontend_read_closed = true;
                         match self.get_frontend_socket().shutdown(net::Shutdown::Read) {
@@ -510,7 +519,10 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
         }
 
         if self.backend_read_closed {
-            log::debug!("Not reading any new responses as backend read end for {} is closed", self.frontend_address.as_str());
+            log::debug!(
+                "Not reading any new responses as backend read end for {} is closed",
+                self.frontend_address.as_str()
+            );
             return Ok(ProxyResult::none()); // We're not going to receive any new packets, so stop here
         }
 
@@ -590,7 +602,10 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
                 // Somehow, we received one more response from the database than what we were expecting. This is BAD (as it could lead to erroneous data and errors being passed to the application, not to mention request smuggling...)
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    format!("proxy request/response flow became desynchronized for {}", self.frontend_address.as_str()),
+                    format!(
+                        "proxy request/response flow became desynchronized for {}",
+                        self.frontend_address.as_str()
+                    ),
                 ));
             }
         }
@@ -636,7 +651,10 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> Proxy<D, P> {
             }
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                format!("{} connection gracefully terminated (no more packets from database)", self.frontend_address.as_str()),
+                format!(
+                    "{} connection gracefully terminated (no more packets from database)",
+                    self.frontend_address.as_str()
+                ),
             ));
         }
 

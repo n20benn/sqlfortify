@@ -1,17 +1,17 @@
 use log;
+use nohash_hasher;
 use polling::{Event, Poller};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use std::{error, fmt, io};
 
-use crate::sqli_detector;
+use crate::sql;
+use crate::sql_wire;
 
+use super::connection::{Connection, IONeed};
 use super::key_pool::KeyPool;
-use super::proxy::{IONeed, Proxy};
 use super::validator;
-
-use super::sql_session::ProxySession;
 
 pub struct Parameters {
     pub validator_params: validator::Parameters,
@@ -46,18 +46,18 @@ impl std::convert::From<std::io::Error> for HandlerError {
     }
 }
 
-pub struct EventHandler<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> {
+pub struct EventHandler<D: sql::Detector, P: sql_wire::Proxy<Socket, Socket>> {
     db_addr: SockAddr,
-    db_key_map: HashMap<usize, usize>,
+    db_key_map: HashMap<usize, usize, nohash_hasher::BuildNoHashHasher<usize>>,
     key_pool: KeyPool,
     listener: Socket,
     listener_key: usize,
     poller: Poller,
-    proxies: HashMap<usize, Proxy<D, P>>,
+    connections: HashMap<usize, Connection<D, P>, nohash_hasher::BuildNoHashHasher<usize>>,
     validator: validator::SqlValidator<D>,
 }
 
-impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D, P> {
+impl<D: sql::Detector, P: sql_wire::Proxy<Socket, Socket>> EventHandler<D, P> {
     pub fn new(
         listen_address: SockAddr,
         db_address: SockAddr,
@@ -93,15 +93,15 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
             listener: listener,
             listener_key: listener_key,
             poller: poller,
-            proxies: HashMap::new(),
-            db_key_map: HashMap::new(),
+            connections: HashMap::with_hasher(nohash_hasher::BuildNoHashHasher::default()),
+            db_key_map: HashMap::with_hasher(nohash_hasher::BuildNoHashHasher::default()),
             validator: validator::SqlValidator::new(params.validator_params),
         })
     }
 
     pub fn handle_loop(&mut self) -> Result<(), HandlerError> {
         let mut new_events = Vec::new();
-        let mut event_keys = HashMap::new();
+        let mut event_keys = HashMap::with_hasher(nohash_hasher::BuildNoHashHasher::default());
 
         loop {
             // If we still have connections to service in the queue, return additional connections immediately
@@ -171,7 +171,7 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
 
     fn handle_listener_event(
         &mut self,
-        event_keys: &mut HashMap<usize, (bool, bool)>,
+        event_keys: &mut HashMap<usize, (bool, bool), nohash_hasher::BuildNoHashHasher<usize>>,
     ) -> Result<(), HandlerError> {
         // We could loop here, calling accept() as many times as it will return, but
         // that could have the potential to starve existing connections.
@@ -188,7 +188,11 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                 match new_client.set_nonblocking(true) {
                     Ok(_) => (),
                     Err(e) => {
-                        log::error!("Failed to set {} client socket to nonblocking: {}", client_addr_name, e);
+                        log::error!(
+                            "Failed to set {} client socket to nonblocking: {}",
+                            client_addr_name,
+                            e
+                        );
                         return Ok(());
                     }
                 }
@@ -207,23 +211,34 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                 match self.poller.add(&new_client, Event::none(client_key)) {
                     Ok(_) => (),
                     Err(e) => {
-                        log::error!("Failed to add {} client socket to poller: {}", client_addr_name, e);
+                        log::error!(
+                            "Failed to add {} client socket to poller: {}",
+                            client_addr_name,
+                            e
+                        );
                         return Ok(());
                     }
                 }
                 match self.poller.add(&backend_socket, Event::none(backend_key)) {
                     Ok(_) => (),
                     Err(e) => {
-                        log::error!("Failed to add {} client socket to poller: {}", client_addr_name, e);
+                        log::error!(
+                            "Failed to add {} client socket to poller: {}",
+                            client_addr_name,
+                            e
+                        );
                         return Ok(());
                     }
                 }
 
-                log::info!("Successfully initialized connection for client {}", client_addr_name);
+                log::info!(
+                    "Successfully initialized connection for client {}",
+                    client_addr_name
+                );
 
-                self.proxies.insert(
+                self.connections.insert(
                     client_key,
-                    Proxy::new(
+                    Connection::new(
                         self.db_addr.clone(),
                         backend_key,
                         backend_socket,
@@ -249,33 +264,33 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
         Ok(())
     }
 
-    fn cleanup_proxy(&mut self, proxy_key: usize) {
-        let proxy = match self.proxies.remove(&proxy_key) {
-            Some(proxy) => proxy,
+    fn connection_cleanup(&mut self, connection_key: usize) {
+        let connection = match self.connections.remove(&connection_key) {
+            Some(conn) => conn,
             None => {
-                log::warn!("Wrong key passed to event handler to clean up proxy resources: key {} had no associated proxy", proxy_key);
+                log::warn!("Wrong key passed to event handler to clean up connection resources: key {} had no associated connection information", connection_key);
                 return;
             }
         };
 
-        self.key_pool.return_key(proxy_key);
-        self.key_pool.return_key(proxy.get_backend_key());
+        self.key_pool.return_key(connection_key);
+        self.key_pool.return_key(connection.get_backend_key());
 
-        self.db_key_map.remove(&proxy.get_backend_key());
-        self.proxies.remove(&proxy_key); // Allows `proxy` to be freed up
-        match self.poller.delete(proxy.get_frontend_socket()) {
+        self.db_key_map.remove(&connection.get_backend_key());
+        self.connections.remove(&connection_key); // Allows `connection` to be freed up
+        match self.poller.delete(connection.get_frontend_socket()) {
             Ok(()) => (),
             Err(e) => log::warn!(
-                "Proxy frontend for socket {} couldn't be removed from poller during cleanup: {}",
-                proxy.get_frontend_address(),
+                "Frontend socket for {} couldn't be removed from poller during cleanup: {}",
+                connection.get_frontend_address(),
                 e
             ),
         }
-        match self.poller.delete(proxy.get_backend_socket()) {
+        match self.poller.delete(connection.get_backend_socket()) {
             Ok(()) => (),
             Err(e) => log::warn!(
-                "Proxy backend for socket {} couldn't be removed from poller during cleanup: {}",
-                proxy.get_frontend_address(),
+                "Backend socket for {} couldn't be removed from poller during cleanup: {}",
+                connection.get_frontend_address(),
                 e
             ),
         }
@@ -283,16 +298,19 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
 
     fn handle_queue(
         &mut self,
-        events: &mut HashMap<usize, (bool, bool)>,
+        events: &mut HashMap<usize, (bool, bool), nohash_hasher::BuildNoHashHasher<usize>>,
     ) -> Result<(), HandlerError> {
         let mut queue = VecDeque::from_iter(events.drain());
 
         while let Some((frontend_key, (incoming, outgoing))) = queue.pop_front() {
-            let proxy = match self.proxies.get_mut(&frontend_key) {
+            let connection = match self.connections.get_mut(&frontend_key) {
                 Some(c) => c,
                 None => {
                     // This should never happen
-                    log::warn!("Proxy information missing for event key {}", frontend_key);
+                    log::warn!(
+                        "Connection information missing for event key {}",
+                        frontend_key
+                    );
                     log::debug!(
                         "Event key had incoming flag set to {}, outgoing flag set to {}",
                         incoming,
@@ -303,8 +321,8 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
             };
 
             log::debug!(
-                "Handling event for client proxy {} with event key {}",
-                proxy.get_frontend_address(),
+                "Handling event for client {} with event key {}",
+                connection.get_frontend_address(),
                 frontend_key
             );
 
@@ -316,11 +334,11 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
 
             if outgoing {
                 log::debug!(
-                    "Processing outgoing packets for client proxy {} with event key {}",
-                    proxy.get_frontend_address(),
+                    "Processing outgoing packets for client {} with event key {}",
+                    connection.get_frontend_address(),
                     frontend_key,
                 );
-                match proxy.process_outgoing(&mut self.validator) {
+                match connection.process_outgoing(&mut self.validator) {
                     Ok(res) => {
                         still_outgoing = res.should_retry;
                         frontend_events |= res.frontend;
@@ -328,16 +346,12 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                     }
                     Err(e) => {
                         log::info!(
-                            "Proxy for client {} closed while processing outgoing packets - {}",
+                            "Client {} closed while processing outgoing packets - {}",
                             frontend_key,
                             e.to_string()
                         );
-                        // Clean up proxy's resources
-                        self.key_pool.return_key(proxy.get_frontend_key());
-                        self.key_pool.return_key(proxy.get_backend_key());
 
-                        self.db_key_map.remove(&proxy.get_backend_key());
-                        self.proxies.remove(&frontend_key); // Allows `proxy` to be freed up
+                        self.connection_cleanup(frontend_key);
                         continue; // Error was unrecoverable, so no sense processing incoming or re-adding socket to polling
                     }
                 };
@@ -345,11 +359,11 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
 
             if incoming {
                 log::debug!(
-                    "Processing incoming packets for client proxy {} with event key {}",
-                    proxy.get_frontend_address(),
+                    "Processing incoming packets for client {} with event key {}",
+                    connection.get_frontend_address(),
                     frontend_key
                 );
-                match proxy.process_incoming(&mut self.validator) {
+                match connection.process_incoming(&mut self.validator) {
                     Ok(res) => {
                         still_incoming = res.should_retry;
                         frontend_events |= res.frontend;
@@ -357,19 +371,19 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
                     }
                     Err(e) => {
                         log::info!(
-                            "Proxy for client {} closed while processing incoming packets - {}",
-                            proxy.get_frontend_address(),
+                            "Client {} closed while processing incoming packets - {}",
+                            connection.get_frontend_address(),
                             e.to_string()
                         );
 
-                        self.cleanup_proxy(frontend_key);
+                        self.connection_cleanup(frontend_key);
                         continue; // Error was unrecoverable, so no sense processing incoming or re-adding socket to polling
                     }
                 };
             }
 
             if still_incoming || still_outgoing {
-                log::debug!("Proxy was still_incoming or still_outgoing--put back into event_keys for next iteration");
+                log::debug!("Connection was still_incoming or still_outgoing--put back into event_keys for next iteration");
                 match events.insert(frontend_key, (still_incoming, still_outgoing)) {
                     Some(_) => log::warn!("event inserted into queue that already contained it (connection state likely corrupted)"),
                     None => (),
@@ -378,18 +392,18 @@ impl<D: sqli_detector::Detector, P: ProxySession<Socket, Socket>> EventHandler<D
             }
 
             if frontend_events != IONeed::None {
-                log::debug!("Frontend events were not none--adding proxy frontend to poller");
+                log::debug!("Frontend events were not none--adding frontend socket to poller");
                 self.poller.modify(
-                    proxy.get_frontend_socket(),
-                    match_event(frontend_events, proxy.get_frontend_key()),
+                    connection.get_frontend_socket(),
+                    match_event(frontend_events, connection.get_frontend_key()),
                 )?;
             }
 
             if backend_events != IONeed::None {
-                log::debug!("Backend events were not none--adding proxy backend to poller");
+                log::debug!("Backend events were not none--adding backend socket to poller");
                 self.poller.modify(
-                    proxy.get_backend_socket(),
-                    match_event(backend_events, proxy.get_backend_key()),
+                    connection.get_backend_socket(),
+                    match_event(backend_events, connection.get_backend_key()),
                 )?;
             }
         }

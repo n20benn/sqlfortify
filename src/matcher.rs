@@ -1,6 +1,6 @@
-use crate::token::SqlToken;
-
-use super::sqli_detector;
+use crate::sql;
+use crate::sql::Token as SqlToken;
+use fnv;
 use std::collections::{hash_map::Entry, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,16 +26,16 @@ impl IDCounter {
     }
 }
 
-struct Node<T: SqlToken> {
+struct Node<T: sql::Token> {
     id: NodeID,
     next_param_id: Option<NodeID>,
     is_valid_pattern: bool,
     is_vuln_prefix: bool,
     is_constant: bool,
-    next: HashMap<T, Node<T>>,
+    next: HashMap<T, Node<T>, fnv::FnvBuildHasher>, // TODO: maybe assess risk of HashDOS in SQLI
 }
 
-impl<T: SqlToken> Node<T> {
+impl<T: sql::Token> Node<T> {
     fn new(id: NodeID) -> Self {
         Self {
             id: id,
@@ -43,7 +43,7 @@ impl<T: SqlToken> Node<T> {
             is_valid_pattern: false,
             is_vuln_prefix: false,
             is_constant: true,
-            next: HashMap::new(),
+            next: HashMap::with_hasher(fnv::FnvBuildHasher::default()),
         }
     }
 
@@ -92,7 +92,7 @@ impl<T: SqlToken> Node<T> {
     }
 }
 
-pub struct NodeInfo<'a, T: SqlToken> {
+pub struct NodeInfo<'a, T: sql::Token> {
     node: &'a Node<T>,
     pub absolute_index: usize,
     pub directional_index: usize,
@@ -100,20 +100,21 @@ pub struct NodeInfo<'a, T: SqlToken> {
     pub has_vuln_prefix: bool,
 }
 
-impl<'a, T: SqlToken> NodeInfo<'a, T> {
+impl<'a, T: sql::Token> NodeInfo<'a, T> {
     pub fn get_id(&self) -> NodeID {
         self.node.id
     }
 }
 
-pub struct SqlMatcher<D: sqli_detector::Detector> {
+/// A Bi-directional Trie data structure, specialized for our particular use case in matching vulnerable/benign SQL queries.
+pub struct BiTrie<D: sql::Detector> {
     fwd_root: Node<D::Token>, // Empty node to make traversal more easy
     rev_root: Node<D::Token>, // ditto
     id_counter: IDCounter,
     // Settings for check strictness can be stored in here (and passed in on new())
 }
 
-impl<D: sqli_detector::Detector> SqlMatcher<D> {
+impl<D: sql::Detector> BiTrie<D> {
     pub fn new() -> Self {
         let mut counter = IDCounter::new();
         Self {
@@ -210,7 +211,7 @@ impl<D: sqli_detector::Detector> SqlMatcher<D> {
         suffix
     }
 
-    pub fn mark_vuln(
+    pub fn mark_vulnerable(
         &mut self,
         sql_query: &Vec<(D::Token, usize)>,
         vuln_prefix_id: Option<NodeID>,
@@ -255,7 +256,7 @@ impl<D: sqli_detector::Detector> SqlMatcher<D> {
 
     // If pattern already exists, just updates is_constant values.
     // Could also name insert()
-    pub fn update_pattern(&mut self, sql_query: Vec<(D::Token, usize)>) {
+    pub fn insert(&mut self, sql_query: Vec<(D::Token, usize)>) {
         let token_id_pairs = self.update_fwd_tree(sql_query);
         self.update_rev_tree(token_id_pairs);
     }

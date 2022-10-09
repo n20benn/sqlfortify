@@ -1,34 +1,33 @@
-use crate::token::SqlToken;
-
-use super::matcher::SqlMatcher;
-use super::sqli_detector;
+use super::matcher::BiTrie;
+use crate::sql;
+use crate::sql::Token as SqlToken;
 
 pub struct Parameters {
-    pub detector_nopattern: sqli_detector::Parameters,
-    pub detector_prefix: sqli_detector::Parameters,
-    pub detector_prefix_suffix: sqli_detector::Parameters,
+    pub detector_nopattern: sql::Parameters,
+    pub detector_prefix: sql::Parameters,
+    pub detector_prefix_suffix: sql::Parameters,
 }
 
 impl Parameters {
     pub fn default() -> Self {
         Parameters {
-            detector_nopattern: sqli_detector::Parameters::default_nopattern(),
-            detector_prefix: sqli_detector::Parameters::default_prefix(),
-            detector_prefix_suffix: sqli_detector::Parameters::default_prefix_suffix(),
+            detector_nopattern: sql::Parameters::default_nopattern(),
+            detector_prefix: sql::Parameters::default_prefix(),
+            detector_prefix_suffix: sql::Parameters::default_prefix_suffix(),
         }
     }
 }
 
-pub struct SqlValidator<D: sqli_detector::Detector> {
-    matcher: SqlMatcher<D>,
+pub struct SqlValidator<D: sql::Detector> {
+    matcher: BiTrie<D>,
     params: Parameters,
 }
 
 // TODO: should there just be `check_query()` with a closure passed in?
-impl<D: sqli_detector::Detector> SqlValidator<D> {
+impl<D: sql::Detector> SqlValidator<D> {
     pub fn new(config_parameters: Parameters) -> Self {
         SqlValidator {
-            matcher: SqlMatcher::new(),
+            matcher: BiTrie::new(),
             params: config_parameters,
         }
     }
@@ -81,7 +80,8 @@ impl<D: sqli_detector::Detector> SqlValidator<D> {
                         token_iter.take(middle_cnt).map(|(t, _)| t),
                         &self.params.detector_prefix_suffix,
                     ) {
-                        self.matcher.mark_vuln(&tokens, Some(prefix_info.get_id()));
+                        self.matcher
+                            .mark_vulnerable(&tokens, Some(prefix_info.get_id()));
                         return Err("query matched a malicious pattern");
                     }
                 }
@@ -91,7 +91,8 @@ impl<D: sqli_detector::Detector> SqlValidator<D> {
                         tokens.iter().map(|(t, _)| t),
                         &self.params.detector_prefix,
                     ) {
-                        self.matcher.mark_vuln(&tokens, Some(prefix_info.get_id()));
+                        self.matcher
+                            .mark_vulnerable(&tokens, Some(prefix_info.get_id()));
                         return Err("query matched a malicious pattern");
                     }
                 }
@@ -101,7 +102,7 @@ impl<D: sqli_detector::Detector> SqlValidator<D> {
             &self.params.detector_nopattern,
         ) {
             // No prefix or suffix matches--query pattern has never been seen before
-            self.matcher.mark_vuln(&tokens, None);
+            self.matcher.mark_vulnerable(&tokens, None);
             return Err("query matched a malicious pattern");
         }
 
@@ -111,7 +112,7 @@ impl<D: sqli_detector::Detector> SqlValidator<D> {
 
     pub fn update_good_query(&mut self, query: &str) {
         let tokens = D::Token::scan_forward(query); // TODO: could pass around ValidationData to these for fewer scanning passes if needs be...
-        self.matcher.update_pattern(tokens); // Adds new safe pattern to matcher
+        self.matcher.insert(tokens); // Adds new safe pattern to matcher
     }
 
     // SQL Errors should come here
@@ -129,6 +130,6 @@ impl<D: sqli_detector::Detector> SqlValidator<D> {
             None => None,
         };
 
-        self.matcher.mark_vuln(&tokens, prefix_id);
+        self.matcher.mark_vulnerable(&tokens, prefix_id);
     }
 }

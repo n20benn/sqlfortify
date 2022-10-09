@@ -8,12 +8,14 @@ edition = "2021"
 [dependencies]
 enum-display-derive = "0.1"
 env_logger = "0.9"
+fnv = "1.0"
 libc = "0.2" # `socket2` and `polling` depend on libc anyways
 log = "0.4"
+nohash-hasher = "0.2.0"
 phf = { version = "0.11", features = ["macros"] }
 polling = "2.2"
 socket2 = { version = "0.4.7", features = ["all"] }
-toml = "0.5"
+#toml = "0.5"
 
 
 
