@@ -168,24 +168,13 @@ pub enum PostgresWireVersion {
 
 pub fn read_startup_packet_len(buffer: &[u8]) -> Result<usize, &'static str> {
     let mut reader = WireReader::new(buffer);
-    let packet_length = reader.read_int32()?;
-    if packet_length < 0 {
-        Err("packet length field was a negative value")
-    } else {
-        Ok(packet_length as usize)
-    }
+    reader.read_length::<i32>()
 }
 
 pub fn read_standard_packet_len(buffer: &[u8]) -> Result<(u8, usize), &'static str> {
     let mut reader = WireReader::new(buffer);
-    let identifier = reader.read_byte()?;
-    let packet_length = match reader.read_int32()? {
-        len if len < 0 => return Err("packet length field was a negative value"),
-        len => (len as usize)
-            .checked_add(1)
-            .ok_or("packet length field too large")?,
-    };
-
+    let identifier = reader.read()?;
+    let packet_length = reader.read_length::<i32>()?.checked_add(1).ok_or("packet length field too large")?;
     Ok((identifier, packet_length))
 }
 
@@ -198,7 +187,7 @@ pub fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &
     let mut reader = WireReader::new(buffer);
     reader.advance_up_to(4);
 
-    let protocol_field = reader.read_int32()?;
+    let protocol_field = reader.read()?;
 
     if (protocol_field == 80877103 || protocol_field == 80877104) && !reader.empty() {
         return Err("startup packet contained more data than expected");
@@ -208,8 +197,8 @@ pub fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &
         196608 => PostgresWireVersion::V3_0, // TODO: allow all minor versions to use this major version as well...?
         80877102 => {
             return Ok(RequestPacket::CancelRequest(
-                reader.read_int32()?,
-                reader.read_int32_and_finalize()?,
+                reader.read()?,
+                reader.read_and_finalize()?,
             ))
         }
         80877103 => return Ok(RequestPacket::SSLRequest),
@@ -217,7 +206,7 @@ pub fn parse_startup_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, &
         _ => return Err("startup packet contained unrecognized protocol version"),
     };
 
-    let params = reader.read_utf8_string_string_map()?;
+    let params = reader.read_str_str_map_term()?;
 
     if let Some(user) = params.get("user") {
         Ok(RequestPacket::StartupMessage(
@@ -246,32 +235,32 @@ pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, 
 
     match packet_identifier {
         b'B' => parse_bind_packet(reader),
-        b'C' => match reader.read_byte()? {
+        b'C' => match reader.read()? {
             b'S' => Ok(RequestPacket::ClosePrepared(
-                reader.read_utf8_c_str_and_finalize()?,
+                reader.read_str_and_finalize()?,
             )),
             b'P' => Ok(RequestPacket::ClosePortal(
-                reader.read_utf8_c_str_and_finalize()?,
+                reader.read_str_and_finalize()?,
             )),
             _ => Err("packet contained invalid Close type parameter"),
         },
         b'd' => Ok(RequestPacket::CopyData(reader.read_remaining_bytes())),
         b'c' => Ok(RequestPacket::CopyDone),
         b'f' => Ok(RequestPacket::CopyFail(
-            reader.read_utf8_c_str_and_finalize()?,
+            reader.read_str_and_finalize()?,
         )),
-        b'D' => match reader.read_byte()? {
+        b'D' => match reader.read()? {
             b'S' => Ok(RequestPacket::DescribePrepared(
-                reader.read_utf8_c_str_and_finalize()?,
+                reader.read_str_and_finalize()?,
             )),
             b'P' => Ok(RequestPacket::DescribePortal(
-                reader.read_utf8_c_str_and_finalize()?,
+                reader.read_str_and_finalize()?,
             )),
             _ => Err("packet contained invalid Describe type parameter"),
         },
         b'E' => Ok(RequestPacket::Execute(
-            reader.read_utf8_c_str()?,
-            reader.read_int32_and_finalize()?,
+            reader.read_str()?,
+            reader.read_and_finalize()?,
         )),
         b'H' => Ok(RequestPacket::Flush),
         b'F' => parse_function_req_packet(reader),
@@ -279,16 +268,16 @@ pub fn parse_standard_req_packet<'a>(buffer: &'a [u8]) -> Result<RequestPacket, 
             reader.read_remaining_bytes(),
         )),
         b'P' => {
-            let prepared_stmt_name = reader.read_utf8_c_str()?;
-            let query_name = reader.read_utf8_c_str()?;
-            let parameters_cnt = reader.read_int16_length()?;
+            let prepared_stmt_name = reader.read_str()?;
+            let query_name = reader.read_str()?;
+            let parameters_cnt = reader.read_length::<i16>()?;
             Ok(RequestPacket::Parse(
                 prepared_stmt_name,
                 query_name,
-                reader.read_int32_list_and_finalize(parameters_cnt)?,
+                reader.read_list_and_finalize(parameters_cnt)?,
             ))
         }
-        b'Q' => Ok(RequestPacket::Query(reader.read_utf8_c_str_and_finalize()?)),
+        b'Q' => Ok(RequestPacket::Query(reader.read_str_and_finalize()?)),
         b'S' => Ok(RequestPacket::Sync),
         b'X' => Ok(RequestPacket::Terminate),
         _ => Err("packet contained unrecognized packet identifier"),
@@ -310,14 +299,14 @@ pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket
 
     match packet_identifier {
         b'K' => Ok(ResponsePacket::BackendKeyData(
-            reader.read_int32()?,
-            reader.read_int32_and_finalize()?,
+            reader.read()?,
+            reader.read_and_finalize()?,
         )),
         b'R' => parse_auth_resp_packet(reader),
         b'2' => Ok(ResponsePacket::BindComplete),
         b'3' => Ok(ResponsePacket::CloseComplete),
         b'C' => Ok(ResponsePacket::CommandComplete(
-            reader.read_utf8_c_str_and_finalize()?,
+            reader.read_str_and_finalize()?,
         )),
         b'd' => Ok(ResponsePacket::CopyData(reader.read_remaining_bytes())),
         b'c' => Ok(ResponsePacket::CopyDone),
@@ -327,7 +316,7 @@ pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket
         b'D' => parse_datarow_response_packet(reader),
         b'I' => Ok(ResponsePacket::EmptyQueryResponse),
         b'E' => Ok(ResponsePacket::ErrorResponse(
-            reader.read_term_utf8_byte_string_map_and_finalize()?,
+            reader.read_u8_str_map_term_and_finalize()?,
         )),
         b'V' => Ok(ResponsePacket::FunctionCallResponse(
             match reader.read_nullable_int32_length()? {
@@ -336,35 +325,35 @@ pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket
             },
         )),
         b'v' => {
-            let newest_minor_proto = reader.read_int32()?;
-            let options_cnt = reader.read_int32_length()?;
+            let newest_minor_proto = reader.read()?;
+            let options_cnt = reader.read_length::<i32>()?;
             Ok(ResponsePacket::NegotiateProtocolVersion(
                 newest_minor_proto,
-                reader.read_utf8_c_strs_and_finalize(options_cnt)?,
+                reader.read_strs_and_finalize(options_cnt)?,
             ))
         }
         b'n' => Ok(ResponsePacket::NoData),
         b'N' => Ok(ResponsePacket::NoticeResponse(
-            reader.read_term_utf8_byte_string_map_and_finalize()?,
+            reader.read_u8_str_map_term_and_finalize()?,
         )),
         b'A' => Ok(ResponsePacket::NotificationResponse(
-            reader.read_int32()?,
-            reader.read_utf8_c_str()?,
-            reader.read_utf8_c_str_and_finalize()?,
+            reader.read()?,
+            reader.read_str()?,
+            reader.read_str_and_finalize()?,
         )),
         b't' => {
-            let parameters_cnt = reader.read_int16_length()?;
+            let parameters_cnt = reader.read_length::<i16>()?;
             Ok(ResponsePacket::ParameterDescription(
-                reader.read_int32_list_and_finalize(parameters_cnt)?,
+                reader.read_list_and_finalize(parameters_cnt)?,
             ))
         }
         b'S' => Ok(ResponsePacket::ParameterStatus(
-            reader.read_utf8_c_str()?,
-            reader.read_utf8_c_str_and_finalize()?,
+            reader.read_str()?,
+            reader.read_str_and_finalize()?,
         )),
         b'1' => Ok(ResponsePacket::ParseComplete),
         b's' => Ok(ResponsePacket::PortalSuspended),
-        b'Z' => Ok(ResponsePacket::ReadyForQuery(match reader.read_byte()? {
+        b'Z' => Ok(ResponsePacket::ReadyForQuery(match reader.read()? {
             b'I' => TransactionStatus::Idle,
             b'T' => TransactionStatus::Transaction,
             b'E' => TransactionStatus::FailedTransaction,
@@ -378,16 +367,16 @@ pub fn parse_standard_resp_packet<'a>(buffer: &'a [u8]) -> Result<ResponsePacket
 fn parse_rowdescription_resp_packet<'a>(
     mut reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
-    let field_cnt = reader.read_int16_length()?;
+    let field_cnt = reader.read_length::<i16>()?;
     let mut fields = Vec::new();
     for _ in 0..field_cnt {
-        let field_name = reader.read_utf8_c_str()?;
-        let table_object_id = reader.read_int32()?;
-        let attribute_number = reader.read_int16()?;
-        let data_type_id = reader.read_int32()?;
-        let data_type_size = reader.read_int16()?;
-        let type_modifier = reader.read_int32()?;
-        let format_code = match reader.read_int16()? {
+        let field_name = reader.read_str()?;
+        let table_object_id = reader.read()?;
+        let attribute_number = reader.read()?;
+        let data_type_id = reader.read()?;
+        let data_type_size = reader.read()?;
+        let type_modifier = reader.read()?;
+        let format_code = match reader.read()? {
             1 => true,
             0 => false,
             _ => return Err("packet contained invalid boolean value for format code"),
@@ -409,18 +398,18 @@ fn parse_rowdescription_resp_packet<'a>(
 fn parse_function_req_packet<'a>(
     mut reader: WireReader<'a>,
 ) -> Result<RequestPacket, &'static str> {
-    let object_id = reader.read_int32()?;
-    let arg_format_code_cnt = reader.read_int16_length()?;
+    let object_id = reader.read()?;
+    let arg_format_code_cnt = reader.read_length::<i16>()?;
     let mut arg_format_codes = Vec::new();
     for _ in 0..arg_format_code_cnt {
-        arg_format_codes.push(match reader.read_int16()? {
+        arg_format_codes.push(match reader.read()? {
             1 => true,
             0 => false,
             _ => return Err("packet contains invalid value for boolean format code field"),
         });
     }
 
-    let argument_cnt = reader.read_int16_length()?;
+    let argument_cnt = reader.read_length::<i16>()?;
     let mut arguments = Vec::new();
     for _ in 0..argument_cnt {
         arguments.push(match reader.read_nullable_int32_length()? {
@@ -429,7 +418,7 @@ fn parse_function_req_packet<'a>(
         });
     }
 
-    let function_result_format = match reader.read_int16_and_finalize()? {
+    let function_result_format = match reader.read_and_finalize()? {
         1 => true,
         0 => false,
         _ => return Err("packet contains invalid value for boolean format code field"),
@@ -446,7 +435,7 @@ fn parse_function_req_packet<'a>(
 fn parse_datarow_response_packet<'a>(
     mut reader: WireReader<'a>,
 ) -> Result<ResponsePacket, &'static str> {
-    let column_cnt = reader.read_int16_length()?;
+    let column_cnt = reader.read_length::<i16>()?;
     let mut column_values = Vec::new();
     for _ in 0..column_cnt {
         column_values.push(match reader.read_nullable_int32_length()? {
@@ -483,16 +472,16 @@ fn parse_copyboth_response_packet<'a>(
 fn parse_copy_response_fields<'a>(
     mut reader: WireReader<'a>,
 ) -> Result<(bool, Vec<bool>), &'static str> {
-    let is_binary = match reader.read_byte()? {
+    let is_binary = match reader.read()? {
         b'1' => true,
         b'0' => false,
         _ => return Err("packet contains invalid value for boolean copy format field"),
     };
 
-    let format_codes_cnt = reader.read_int16_length()?;
+    let format_codes_cnt = reader.read_length::<i16>()?;
     let mut format_codes = Vec::new();
     for _ in 0..format_codes_cnt {
-        format_codes.push(match reader.read_int16()? {
+        format_codes.push(match reader.read()? {
             1 => true,
             0 => false,
             _ => return Err("packet contains invalid value for boolean format code field"),
@@ -503,7 +492,7 @@ fn parse_copy_response_fields<'a>(
 }
 
 fn parse_auth_resp_packet<'a>(mut reader: WireReader<'a>) -> Result<ResponsePacket, &'static str> {
-    let auth_mechanism = reader.read_int32()?;
+    let auth_mechanism = reader.read()?;
     match auth_mechanism {
         0 | 2 | 6 | 7 | 9 => reader.finalize()?,
         _ => (),
@@ -514,7 +503,7 @@ fn parse_auth_resp_packet<'a>(mut reader: WireReader<'a>) -> Result<ResponsePack
         2 => Ok(ResponsePacket::AuthenticationKerberosV5),
         3 => Ok(ResponsePacket::AuthenticationCleartextPassword),
         5 => Ok(ResponsePacket::AuthenticationMD5Password(
-            reader.read_4_bytes_and_finalize()?,
+            reader.read_bytearray_and_finalize()?,
         )),
         6 => Ok(ResponsePacket::AuthenticationSCMCredential),
         7 => Ok(ResponsePacket::AuthenticationGSS),
@@ -523,7 +512,7 @@ fn parse_auth_resp_packet<'a>(mut reader: WireReader<'a>) -> Result<ResponsePack
         )),
         9 => Ok(ResponsePacket::AuthenticationSSPI),
         10 => Ok(ResponsePacket::AuthenticationSASL(
-            reader.read_term_utf8_c_strs_and_finalize()?,
+            reader.read_strs_term_and_finalize()?,
         )),
         11 => Ok(ResponsePacket::AuthenticationSASLContinue(
             reader.read_remaining_bytes(),
@@ -536,19 +525,19 @@ fn parse_auth_resp_packet<'a>(mut reader: WireReader<'a>) -> Result<ResponsePack
 }
 
 fn parse_bind_packet<'a>(mut reader: WireReader<'a>) -> Result<RequestPacket, &'static str> {
-    let dest_portal = reader.read_utf8_c_str()?;
-    let prepared_stmt = reader.read_utf8_c_str()?;
-    let format_codes_cnt = reader.read_int16_length()?;
+    let dest_portal = reader.read_str()?;
+    let prepared_stmt = reader.read_str()?;
+    let format_codes_cnt = reader.read_length::<i16>()?;
     let mut format_codes = Vec::new();
     for _ in 0..format_codes_cnt {
-        format_codes.push(match reader.read_int16()? {
+        format_codes.push(match reader.read()? {
             0 => false,
             1 => true,
             _ => return Err("packet contained invalid parameter format code"),
         });
     }
 
-    let parameters_cnt = reader.read_int16_length()?;
+    let parameters_cnt = reader.read_length::<i16>()?;
     let mut parameters = Vec::new();
     for _ in 0..parameters_cnt {
         parameters.push(match reader.read_nullable_int32_length()? {
@@ -557,10 +546,10 @@ fn parse_bind_packet<'a>(mut reader: WireReader<'a>) -> Result<RequestPacket, &'
         });
     }
 
-    let result_format_codes_cnt = reader.read_int16_length()?;
+    let result_format_codes_cnt = reader.read_length::<i16>()?;
     let mut result_format_codes = Vec::new();
     for _ in 0..result_format_codes_cnt {
-        result_format_codes.push(match reader.read_int16()? {
+        result_format_codes.push(match reader.read()? {
             1 => true,
             0 => false,
             _ => return Err("packet contained invalid result-column format code"),

@@ -12,8 +12,8 @@ use super::validator::SqlValidator;
 const REQUEST_QUEUE_SOFT_LIMIT: usize = 10;
 const RESPONSE_QUEUE_SOFT_LIMIT: usize = 10;
 
-const CODE_EINPROGRESS: i32 = 115;
 const CODE_EISCONNECTED: i32 = 106;
+const CODE_EINPROGRESS: i32 = 115;
 
 struct RequestMetadata {
     is_malicious: bool,

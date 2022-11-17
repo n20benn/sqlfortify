@@ -1,6 +1,7 @@
 pub mod mysql_session;
 pub mod postgres_session;
 
+mod mysql_packet;
 mod postgres_packet;
 mod wire_reader;
 
