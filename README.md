@@ -2,6 +2,9 @@
 
 SQLFortify - pluggable, self-learning defense in depth against SQL injection attacks
 
+SQLFortify is a database extension that provides advanced intrusion prevention capabilities against SQL injection (SQLI) attacks.
+In addition to detecting individual attempts at SQL injection, SQLFortify is capable of determining what query parameter is the most likely source of SQLI, and can use this to block any further injection attempts via that parameter.
+
 ## Building
 
 To build the project, first make sure you [have rust installed](https://www.rust-lang.org/tools/install).
