@@ -9,7 +9,7 @@ mod sql_wire;
 
 use socket2::{SockAddr, Socket};
 use sql::cockroach_detector::CockroachDetector;
-use std::{fs, io::Read, net::SocketAddr, path};
+use std::{env, fs, io::Read, net::SocketAddr, path};
 //use toml::{self, Deserializer};
 
 use sql_wire::postgres_session::PostgresProxySession;
@@ -101,8 +101,15 @@ fn main() {
 
     // TODO: parse configuration here
 
-    let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap(); // TODO: remove unwrap
-    let db: SocketAddr = "127.0.0.1:5432".parse().unwrap(); // TODO: remove unwrap
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 5 {
+        println!("Usage: sqlfortify <listening_addr> <listening_port> <db_addr> <db_port>");
+    }
+
+    let (laddr, lport, daddr, dport) = (args[1].as_str(), args[2].as_str(), args[3].as_str(), args[4].as_str());
+
+    let listen: SocketAddr = format!("{}:{}", laddr, lport).parse().unwrap(); // TODO: remove unwrap
+    let db: SocketAddr = format!("{}:{}", daddr, dport).parse().unwrap(); // TODO: remove unwrap
 
     let listen = SockAddr::from(listen);
     let db = SockAddr::from(db);
